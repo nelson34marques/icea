@@ -16,6 +16,10 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'admin';
     }
 
+
+
+
+
     match /users/{userId} {
       allow read: if ownProfile(userId) || isAdmin();
       allow create: if ownProfile(userId)
