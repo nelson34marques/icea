@@ -12,6 +12,7 @@ import {
   Download,
   Home,
   Inbox,
+  LogOut,
   Menu,
   MoreHorizontal,
   Plus,
@@ -25,8 +26,18 @@ import {
   X,
 } from 'lucide-react';
 import { createRoot } from 'react-dom/client';
+import AuthScreen from './AuthScreen';
 import { useInstallPrompt, useOnline, useServiceWorker } from './hooks/usePwa';
 import { api, API_URL } from './services/api';
+import {
+  addAttendanceRecord,
+  addVisitorRecord,
+  signOutUser,
+  subscribeToAttendanceRecords,
+  subscribeToAuthState,
+  subscribeToUserProfile,
+  subscribeToVisitorRecords,
+} from './services/firebase';
 import './styles.css';
 
 const VIEW_SLUGS = { 'Visão geral': 'geral', 'Presenças': 'presencas', Turmas: 'turmas', Pessoas: 'pessoas', Calendário: 'calendario', Definições: 'definicoes' };
@@ -147,6 +158,7 @@ const SYNC_COPY = {
 };
 
 function App() {
+  const [authSession, setAuthSession] = useState({ loading: true, user: null, profile: null, error: '' });
   const [active, setActiveState] = useState(viewFromUrl);
   const online = useOnline();
   const { canInstall, install, dismiss: dismissInstall } = useInstallPrompt();
@@ -155,13 +167,57 @@ function App() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [modal, setModal] = useState('');
-  const [localVisitors, setLocalVisitors] = useState([]);
+  const [visitorRecords, setVisitorRecords] = useState([]);
+  const [attendanceRecords, setAttendanceRecords] = useState([]);
   const [attendanceStatus, setAttendanceStatus] = useState({});
   const [period, setPeriod] = useState('Este mês');
   const [notice, setNotice] = useState('');
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => localStorage.getItem('icea-notifications') !== 'false');
   const [dashboard, setDashboard] = useState(EMPTY_DASHBOARD);
   const [sync, setSync] = useState({ status: 'loading', savedAt: 0, error: '' });
+
+  useEffect(() => {
+    let unsubscribeProfile = () => {};
+    const unsubscribeAuth = subscribeToAuthState((user) => {
+      unsubscribeProfile();
+      if (!user) {
+        setDashboard(EMPTY_DASHBOARD);
+        setVisitorRecords([]);
+        setAttendanceRecords([]);
+        setAttendanceStatus({});
+        setModal('');
+        setSync({ status: 'loading', savedAt: 0, error: '' });
+        setAuthSession({ loading: false, user: null, profile: null, error: '' });
+        return;
+      }
+
+      setAuthSession({ loading: true, user, profile: null, error: '' });
+      unsubscribeProfile = subscribeToUserProfile(user, (profile) => {
+        setAuthSession({ loading: false, user, profile, error: '' });
+      }, (error) => {
+        setAuthSession({ loading: false, user, profile: { status: 'user' }, error: error.message });
+      });
+    });
+
+    return () => {
+      unsubscribeAuth();
+      unsubscribeProfile();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!authSession.user || authSession.loading) return undefined;
+
+    const onReadError = (error) => setNotice(`Não foi possível ler os registos Firebase: ${error.message}`);
+    const unsubscribeVisitors = subscribeToVisitorRecords(setVisitorRecords, onReadError);
+    const unsubscribeAttendance = subscribeToAttendanceRecords(setAttendanceRecords, onReadError);
+    return () => {
+      unsubscribeVisitors();
+      unsubscribeAttendance();
+    };
+  }, [authSession.user, authSession.loading]);
+
+  const isAdmin = authSession.profile?.status === 'admin';
 
   const syncDashboard = useCallback(async ({ silent = false } = {}) => {
     if (!silent) setSync((current) => ({ ...current, status: 'loading', error: '' }));
@@ -176,22 +232,34 @@ function App() {
     }
   }, []);
 
-  useEffect(() => { syncDashboard(); }, [syncDashboard]);
+  useEffect(() => {
+    if (authSession.user && !authSession.loading) syncDashboard();
+  }, [authSession.user, authSession.loading, syncDashboard]);
 
   useEffect(() => {
-    const onVisible = () => { if (document.visibilityState === 'visible') syncDashboard({ silent: true }); };
+    const onVisible = () => { if (authSession.user && document.visibilityState === 'visible') syncDashboard({ silent: true }); };
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
-  }, [syncDashboard]);
+  }, [authSession.user, syncDashboard]);
 
   const classes = dashboard.classes ?? [];
   const members = dashboard.members ?? [];
   const sessions = dashboard.sessions ?? [];
   const stats = dashboard.stats ?? {};
-  const visitors = [...localVisitors, ...(dashboard.visitors ?? [])];
+  const visitors = [...visitorRecords, ...(dashboard.visitors ?? [])];
   const visibleMembers = members.map((person) => ({ ...person, status: attendanceStatus[person.id] || person.status }));
   const isBootLoading = sync.status === 'loading' && !classes.length && !members.length && !sessions.length && !visitors.length;
   const hasNoData = !classes.length && !members.length && !sessions.length && !visitors.length;
+
+  useEffect(() => {
+    const nextStatuses = {};
+    for (const record of attendanceRecords) {
+      for (const entry of record.attendance || []) {
+        if (!(entry.memberId in nextStatuses)) nextStatuses[entry.memberId] = entry.status;
+      }
+    }
+    setAttendanceStatus(nextStatuses);
+  }, [attendanceRecords]);
 
   const searchTerm = searchQuery.trim().toLocaleLowerCase('pt-PT');
   const searchResults = useMemo(() => {
@@ -215,6 +283,7 @@ function App() {
   const attendance = useMemo(() => attendanceSeries(sessions, period), [sessions, period]);
   const syncCopy = SYNC_COPY[sync.status];
   const toggleNotifications = () => {
+    if (!isAdmin) return;
     const next = !notificationsEnabled;
     setNotificationsEnabled(next);
     localStorage.setItem('icea-notifications', String(next));
@@ -236,6 +305,7 @@ function App() {
   }, []);
 
   function exportCsv(type) {
+    if (!isAdmin) return;
     const rows = type === 'Turmas' ? classes : type === 'Pessoas' ? visibleMembers : visitors;
     const headers = type === 'Turmas' ? ['Nome', 'Professor', 'Alunos'] : type === 'Pessoas' ? ['Nome', 'Turma', 'Estado'] : ['Nome', 'Turma', 'Data'];
     const values = rows.map((item) => type === 'Turmas'
@@ -252,21 +322,33 @@ function App() {
     setNotice(`Ficheiro de ${type.toLocaleLowerCase('pt-PT')} exportado.`);
   }
 
-  function saveAttendance(classId, selectedIds) {
-    const updates = Object.fromEntries(visibleMembers.filter((person) => person.class_id === classId).map((person) => [person.id, selectedIds.includes(person.id) ? 'Presente' : 'Ausente']));
-    setAttendanceStatus((current) => ({ ...current, ...updates }));
-    setModal('');
-    setNotice('Presenças aplicadas nesta sessão. A API ainda não disponibiliza gravação.');
+  async function saveAttendance(classId, selectedIds) {
+    if (!isAdmin) return;
+    try {
+      await addAttendanceRecord(classId, visibleMembers, selectedIds, authSession.user);
+      setModal('');
+      setNotice('Presenças guardadas no Firebase.');
+    } catch (error) {
+      setNotice(`Não foi possível guardar as presenças: ${error.message}`);
+    }
   }
 
-  function saveVisitor(visitor) {
-    setLocalVisitors((current) => [{ ...visitor, id: `local-${Date.now()}`, initials: initialsOf(visitor.name), date: 'Agora' }, ...current]);
-    setModal('');
-    setNotice('Visitante adicionado nesta sessão. A API ainda não disponibiliza gravação.');
+  async function saveVisitor(visitor) {
+    if (!isAdmin) return;
+    try {
+      await addVisitorRecord(visitor, authSession.user);
+      setModal('');
+      setNotice('Visitante guardado no Firebase.');
+    } catch (error) {
+      setNotice(`Não foi possível guardar o visitante: ${error.message}`);
+    }
   }
+
+  if (authSession.loading) return <main className="auth-shell"><div className="auth-loading" role="status">A verificar sessão...</div></main>;
+  if (!authSession.user) return <AuthScreen />;
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-role={isAdmin ? 'admin' : 'user'}>
       <aside className={`sidebar ${mobileOpen ? 'sidebar-open' : ''}`}>
 <div className="brand-lockup">
           <div><strong>ICEA</strong><small>Comunidade viva</small></div>
@@ -290,7 +372,7 @@ function App() {
           </div>
           {sync.status !== 'live' && <button className="nav-item sync-retry" onClick={() => syncDashboard()}><RefreshCw size={16} /><span>Tentar novamente</span></button>}
           <button className={`nav-item ${active === 'Definições' ? 'active' : ''}`} onClick={() => { setActive('Definições'); setMobileOpen(false); }}><Settings size={19} /><span>Definições</span></button>
-          <button className="profile-mini" onClick={() => setModal('profile')}><div className="avatar avatar-profile"><UserRound size={16} /></div><div><strong>Utilizador</strong><small>Sem sessão iniciada</small></div><MoreHorizontal size={18} /></button>
+          <button className="profile-mini" onClick={() => setModal('profile')}><div className="avatar avatar-profile"><UserRound size={16} /></div><div><strong>{authSession.profile?.displayName || authSession.user.displayName || authSession.user.email}</strong><small>{isAdmin ? 'Administrador' : 'Utilizador · leitura'}</small></div><MoreHorizontal size={18} /></button>
         </div>
       </aside>
 
@@ -303,7 +385,7 @@ function App() {
           <div className="topbar-actions">
             <div className={`search-wrap ${searchOpen ? 'search-visible' : ''}`}><Search size={18} /><input autoFocus={searchOpen} value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Pesquisar..." aria-label="Pesquisar" /></div>
             <button className="icon-button search-trigger" onClick={() => setSearchOpen((open) => !open)} aria-label="Pesquisar"><Search size={19} /></button>
-            <button className="icon-button notification-button" onClick={() => setModal('notifications')} aria-label="Notificações"><Bell size={19} />{notificationsEnabled && <span />}</button>
+            {isAdmin && <button className="icon-button notification-button" onClick={() => setModal('notifications')} aria-label="Notificações"><Bell size={19} />{notificationsEnabled && <span />}</button>}
             <div className="top-avatar"><UserRound size={15} /></div>
           </div>
         </header>
@@ -317,7 +399,7 @@ function App() {
             </div>
             <div className="welcome-actions">
               <button className="outline-button refresh-button" onClick={() => syncDashboard()} disabled={sync.status === 'loading'}><RefreshCw size={16} /> Sincronizar</button>
-              <button className="primary-button" onClick={() => setModal('attendance')} disabled={!members.length}><Plus size={18} /> Registar presença</button>
+              {isAdmin && <button className="primary-button" onClick={() => setModal('attendance')} disabled={!members.length}><Plus size={18} /> Registar presença</button>}
             </div>
           </section>
 
@@ -349,13 +431,13 @@ function App() {
           </section>
 
           <section className="bottom-grid">
-            <div className="panel people-panel"><div className="panel-heading"><div><span className="section-kicker">Últimos registos</span><h2>Pessoas recentes</h2></div><button className="icon-button" onClick={() => exportCsv('Pessoas')} disabled={!visibleMembers.length} aria-label="Exportar pessoas"><Download size={17} /></button></div>{visibleMembers.length ? <div className="people-table"><div className="table-head"><span>Pessoa</span><span>Turma</span><span>Estado</span></div>{visibleMembers.slice(0, 4).map((person) => <div className="person-row" key={person.id}><div className="person-name"><div className="avatar">{person.initials || initialsOf(person.name)}</div><strong>{person.name}</strong></div><span>{getClassName(person.class_id)}</span><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Sem pessoas registadas" hint="A API ainda não devolveu membros." />}</div>
-            <div className="panel visitors-panel"><div className="panel-heading"><div><span className="section-kicker">Acolhimento</span><h2>Visitantes recentes</h2></div><button className="text-button" onClick={() => setActive('Pessoas')}>Ver todos <span>↗</span></button></div>{visitors.length ? <div className="visitor-list">{visitors.slice(0, 3).map((visitor) => <div className="visitor-row" key={visitor.id}><div className="avatar visitor-avatar">{visitor.initials || initialsOf(visitor.name)}</div><div><strong>{visitor.name}</strong><small>{visitor.className || 'Visitante'}</small></div><time>{visitor.date || 'Data indisponível'}</time></div>)}</div> : <EmptyState icon={Sparkles} title="Sem visitantes registados" hint="Os visitantes aparecem aqui depois de uma sessão." />}<button className="outline-button" onClick={() => setModal('visitor')}><Plus size={16} /> Adicionar visitante</button></div>
+            <div className="panel people-panel"><div className="panel-heading"><div><span className="section-kicker">Últimos registos</span><h2>Pessoas recentes</h2></div>{isAdmin && <button className="icon-button" onClick={() => exportCsv('Pessoas')} disabled={!visibleMembers.length} aria-label="Exportar pessoas"><Download size={17} /></button>}</div>{visibleMembers.length ? <div className="people-table"><div className="table-head"><span>Pessoa</span><span>Turma</span><span>Estado</span></div>{visibleMembers.slice(0, 4).map((person) => <div className="person-row" key={person.id}><div className="person-name"><div className="avatar">{person.initials || initialsOf(person.name)}</div><strong>{person.name}</strong></div><span>{getClassName(person.class_id)}</span><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Sem pessoas registadas" hint="A API ainda não devolveu membros." />}</div>
+            <div className="panel visitors-panel"><div className="panel-heading"><div><span className="section-kicker">Acolhimento</span><h2>Visitantes recentes</h2></div><button className="text-button" onClick={() => setActive('Pessoas')}>Ver todos <span>↗</span></button></div>{visitors.length ? <div className="visitor-list">{visitors.slice(0, 3).map((visitor) => <div className="visitor-row" key={visitor.id}><div className="avatar visitor-avatar">{visitor.initials || initialsOf(visitor.name)}</div><div><strong>{visitor.name}</strong><small>{visitor.className || 'Visitante'}</small></div><time>{visitor.date || 'Data indisponível'}</time></div>)}</div> : <EmptyState icon={Sparkles} title="Sem visitantes registados" hint="Os visitantes aparecem aqui depois de uma sessão." />}{isAdmin && <button className="outline-button" onClick={() => setModal('visitor')}><Plus size={16} /> Adicionar visitante</button>}</div>
           </section>
-          </> : hasNoData ? <EmptyState icon={Inbox} title="Ainda não há dados" hint="Sincronize com a API para carregar os dados da comunidade." /> : <WorkspacePage active={active} classes={classes} members={visibleMembers} visitors={visitors} sessions={sessions} getClassName={getClassName} onExport={exportCsv} onAttendance={() => setModal('attendance')} onAddVisitor={() => setModal('visitor')} sync={sync} onSync={() => syncDashboard()} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} />}
+          </> : hasNoData ? <EmptyState icon={Inbox} title="Ainda não há dados" hint="Sincronize com a API para carregar os dados da comunidade." /> : <WorkspacePage active={active} classes={classes} members={visibleMembers} visitors={visitors} sessions={sessions} getClassName={getClassName} onExport={exportCsv} onAttendance={() => setModal('attendance')} onAddVisitor={() => setModal('visitor')} sync={sync} onSync={() => syncDashboard()} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} isAdmin={isAdmin} />}
         </div>
       </main>
-      {modal && <ActionDialog type={modal} classes={classes} members={visibleMembers} sessions={sessions} onClose={() => setModal('')} onSaveAttendance={saveAttendance} onSaveVisitor={saveVisitor} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} />}
+      {modal && <ActionDialog type={modal} classes={classes} members={visibleMembers} sessions={sessions} onClose={() => setModal('')} onSaveAttendance={saveAttendance} onSaveVisitor={saveVisitor} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} user={authSession.user} profile={authSession.profile} onSignOut={signOutUser} />}
 
       <PwaBar online={online} canInstall={canInstall} onInstall={install} onDismissInstall={dismissInstall} updateReady={updateReady} onApplyUpdate={applyUpdate} />
     </div>
@@ -383,7 +465,7 @@ function DashboardSkeleton() {
   </div>;
 }
 
-function WorkspacePage({ active, classes, members, visitors, sessions, getClassName, onExport, onAttendance, onAddVisitor, sync, onSync, notificationsEnabled, onToggleNotifications }) {
+function WorkspacePage({ active, classes, members, visitors, sessions, getClassName, onExport, onAttendance, onAddVisitor, sync, onSync, notificationsEnabled, onToggleNotifications, isAdmin }) {
   if (active === 'Turmas') return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Organização</span><h1>Turmas</h1><p>{classes.length ? plural(classes.length, 'turma disponível', 'turmas disponíveis') : 'Sem dados recebidos'}</p></div><button className="outline-button export-button" onClick={() => onExport('Turmas')} disabled={!classes.length}><Download size={16} /> Exportar CSV</button></div>{classes.length ? <div className="workspace-list">{classes.map((item, index) => <article className="workspace-row" key={item.id}><div className={`class-badge ${item.color || ['coral', 'sky', 'gold', 'mint'][index % 4]}`}><BookOpen size={17} /></div><div className="workspace-row-copy"><strong>{item.name}</strong><small>{item.age_min != null && item.age_max != null ? `${item.age_min}–${item.age_max} anos` : 'Faixa etária não indicada'} · {item.professor_name || item.equipa?.Professor?.[0]?.nome || 'Equipa por consultar'}</small></div><span>{item.alunos ?? item.students ?? 0} alunos</span></article>)}</div> : <EmptyState icon={BookOpen} title="Sem turmas" hint="A API não devolveu turmas." />}</section>;
 
   if (active === 'Pessoas') return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Comunidade</span><h1>Pessoas</h1><p>{members.length || visitors.length ? `${plural(members.length, 'pessoa registada', 'pessoas registadas')} e ${plural(visitors.length, 'visitante', 'visitantes')}` : 'Sem dados recebidos'}</p></div><div className="workspace-actions"><button className="outline-button export-button" onClick={() => onExport('Pessoas')} disabled={!members.length}><Download size={16} /> Exportar</button><button className="primary-button" onClick={onAddVisitor}><Plus size={16} /> Visitante</button></div></div>{members.length ? <div className="panel workspace-table"><div className="workspace-table-head"><span>Nome</span><span>Turma</span><span>Estado</span></div>{members.map((person) => <div className="workspace-table-row" key={person.id}><strong>{person.name}</strong><span>{getClassName(person.class_id)}</span><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Sem pessoas registadas" hint="A API não devolveu membros." />}<h2 className="workspace-subheading">Visitantes</h2>{visitors.length ? <div className="panel workspace-table">{visitors.map((visitor) => <div className="workspace-table-row visitor-table-row" key={visitor.id}><strong>{visitor.name}</strong><span>{visitor.className || 'Visitante'}</span><span>{visitor.date || 'Data indisponível'}</span></div>)}</div> : <EmptyState icon={Sparkles} title="Sem visitantes" hint="A API não devolveu visitantes." />}</section>;
@@ -395,10 +477,10 @@ function WorkspacePage({ active, classes, members, visitors, sessions, getClassN
   return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Aplicação</span><h1>Definições</h1><p>Preferências e estado dos dados</p></div></div><div className="panel settings-list"><div className="setting-row"><span><strong>Origem dos dados</strong><small>{API_URL}</small></span><span className={`setting-status ${sync.status === 'live' ? '' : 'setting-status-warn'}`}>{sync.status === 'live' ? 'API ligada' : sync.status === 'loading' ? 'A sincronizar' : 'Desligada'}</span></div><div className="setting-row"><span><strong>Última sincronização</strong><small>{sync.savedAt ? relativeTime(sync.savedAt) : 'Nunca houve sincronização'}</small></span><button className="outline-button export-button" onClick={onSync} disabled={sync.status === 'loading'}><RefreshCw size={16} /> Sincronizar</button></div><div className="setting-row"><span><strong>Exportação</strong><small>Descarregar listagens de turmas e pessoas</small></span><button className="outline-button export-button" onClick={() => onExport('Turmas')} disabled={!classes.length}><Download size={16} /> Exportar turmas</button></div><div className="setting-row"><span><strong>Notificações</strong><small>Mostrar o indicador de notificações na barra superior</small></span><input type="checkbox" checked={notificationsEnabled} onChange={onToggleNotifications} /></div><div className="setting-row"><span><strong>Conta</strong><small>A autenticação ainda não está ligada</small></span><span className="setting-status setting-status-warn">Sem sessão</span></div></div></section>;
 }
 
-function ActionDialog({ type, classes, members, onClose, onSaveAttendance, onSaveVisitor, notificationsEnabled, onToggleNotifications }) {
+function ActionDialog({ type, classes, members, onClose, onSaveAttendance, onSaveVisitor, notificationsEnabled, onToggleNotifications, user, profile, onSignOut }) {
   const [selectedClass, setSelectedClass] = useState(classes[0]?.id ?? '');
   const [selectedMembers, setSelectedMembers] = useState([]);
-  const classMembers = members.filter((person) => person.class_id === selectedClass);
+  const classMembers = members.filter((person) => String(person.class_id) === String(selectedClass));
 
   useEffect(() => {
     setSelectedMembers(members.filter((person) => person.class_id === selectedClass && person.status === 'Presente').map((person) => person.id));
@@ -421,7 +503,7 @@ function ActionDialog({ type, classes, members, onClose, onSaveAttendance, onSav
     {type === 'attendance' && <form onSubmit={submitAttendance}><label className="form-field">Turma<select value={selectedClass} onChange={(event) => setSelectedClass(event.target.value)}>{classes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>{classMembers.length ? <div className="attendance-checklist">{classMembers.map((person) => <label className="check-row" key={person.id}><input type="checkbox" checked={selectedMembers.includes(person.id)} onChange={(event) => setSelectedMembers((current) => event.target.checked ? [...current, person.id] : current.filter((id) => id !== person.id))} /><span>{person.name}</span></label>)}</div> : <p className="dialog-note">Esta turma não tem pessoas registadas.</p>}<p className="dialog-note">Esta alteração vale apenas para esta sessão. A API ainda não disponibiliza gravação de presenças.</p><button className="primary-button dialog-submit" type="submit" disabled={!classMembers.length}><Check size={16} /> Aplicar presenças</button></form>}
     {type === 'visitor' && <form onSubmit={submitVisitor}><label className="form-field">Nome<input name="name" required autoFocus placeholder="Nome completo" /></label><label className="form-field">Turma de acolhimento<select name="className"><option value="Visitante">Sem turma</option>{classes.map((item) => <option key={item.id} value={item.name}>{item.name}</option>)}</select></label><p className="dialog-note">O visitante fica visível apenas nesta sessão. A API ainda não disponibiliza gravação de novos registos.</p><button className="primary-button dialog-submit" type="submit"><Plus size={16} /> Adicionar visitante</button></form>}
     {type === 'notifications' && <div className="dialog-copy"><p>O indicador de notificações está {notificationsEnabled ? 'ativo' : 'inativo'} nas definições locais.</p><button className="outline-button" onClick={onToggleNotifications}>{notificationsEnabled ? 'Desativar' : 'Ativar'} notificações</button></div>}
-    {type === 'profile' && <div className="dialog-copy"><div className="profile-dialog-avatar"><UserRound size={22} /></div><strong>Sem sessão iniciada</strong><p>A autenticação ainda não está ligada a esta instalação. O acesso dos utilizadores chega com a próxima fase.</p><button className="outline-button" onClick={onClose}>Fechar</button></div>}
+    {type === 'profile' && <div className="dialog-copy"><div className="profile-dialog-avatar"><UserRound size={22} /></div><strong>{profile?.displayName || user?.displayName || user?.email}</strong><p>{profile?.status === 'admin' ? 'Administrador com acesso de gestão.' : 'Utilizador com acesso apenas de leitura.'}</p><button className="outline-button" onClick={onSignOut}>Terminar sessão</button></div>}
   </section></div>;
 }
 

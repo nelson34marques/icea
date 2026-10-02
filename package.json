@@ -9,10 +9,17 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@firebase/analytics": "^0.10.25",
+    "@firebase/app": "^0.16.2",
+    "@firebase/auth": "^1.13.6",
+    "@firebase/firestore": "^4.17.2",
     "@vitejs/plugin-react": "latest",
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
     "vite": "latest"
+  },
+  "overrides": {
+    "@grpc/grpc-js": "^1.14.5"
   }
 }
