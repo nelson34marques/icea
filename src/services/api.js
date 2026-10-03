@@ -31,15 +31,19 @@ async function request(path) {
   try {
     response = await fetch(`${API_URL}${path}`, { signal: controller.signal, headers: { Accept: 'application/json' } });
   } catch (error) {
-    if (error?.name === 'AbortError') throw new Error('A API não respondeu dentro do tempo esperado.');
-    throw new Error('Não foi possível estabelecer ligação com a API.');
+    if (error?.name === 'AbortError') throw new Error('O carregamento está a demorar mais do que o normal. Tente novamente daqui a pouco.');
+    throw new Error('Não foi possível carregar os dados. Verifique a ligação e tente novamente.');
   } finally {
     clearTimeout(timeout);
   }
 
-  if (response.status === 404) throw new Error(`Endpoint não encontrado: ${path}`);
-  if (!response.ok) throw new Error(`A API respondeu com o erro ${response.status}.`);
-  return response.json();
+  if (response.status === 404) throw new Error('Algumas informações ainda não estão disponíveis. Tente novamente mais tarde.');
+  if (!response.ok) throw new Error('Não foi possível atualizar os dados. Tente novamente daqui a pouco.');
+  try {
+    return await response.json();
+  } catch {
+    throw new Error('Recebemos uma resposta inesperada. Tente novamente mais tarde.');
+  }
 }
 
 async function fetchSessions() {
