@@ -30,6 +30,8 @@ import AuthScreen from './AuthScreen';
 import { useInstallPrompt, useOnline, useServiceWorker } from './hooks/usePwa';
 import { api, API_URL } from './services/api';
 import {
+
+  
   addAttendanceRecord,
   addVisitorRecord,
   signOutUser,
