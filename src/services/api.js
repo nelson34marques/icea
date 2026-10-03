@@ -1,6 +1,16 @@
+import { auth } from './firebase';
+
 export const API_URL = (import.meta.env.VITE_API_URL || 'https://ebd-api-n7xg.onrender.com').replace(/\/$/, '');
 
 const REQUEST_TIMEOUT = 45000;
+
+async function authHeader() {
+  const user = auth.currentUser;
+  if (!user) throw Object.assign(new Error('Sessão terminada. Inicie sessão novamente.'), { sessao: true });
+  const token = await user.getIdToken();
+  if (!token) throw Object.assign(new Error('Não foi possível validar a sessão. Inicie sessão novamente.'), { sessao: true });
+  return { Authorization: `Bearer ${token}` };
+}
 
 function listFrom(payload, key) {
   if (Array.isArray(payload)) return payload;
@@ -29,15 +39,24 @@ async function request(path) {
 
   let response;
   try {
-    response = await fetch(`${API_URL}${path}`, { signal: controller.signal, headers: { Accept: 'application/json' } });
+    const authHeaders = await authHeader();
+    response = await fetch(`${API_URL}${path}`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json', ...authHeaders },
+    });
   } catch (error) {
     if (error?.name === 'AbortError') throw new Error('O carregamento está a demorar mais do que o normal. Tente novamente daqui a pouco.');
+    if (error?.sessao) throw error;
     throw new Error('Não foi possível carregar os dados. Verifique a ligação e tente novamente.');
   } finally {
     clearTimeout(timeout);
   }
 
+  if (response.status === 401) throw new Error('Sessão expirada ou não autorizada. Inicie sessão novamente.');
+  if (response.status === 403) throw new Error('A sua conta não tem permissão para aceder a estes dados.');
   if (response.status === 404) throw new Error('Algumas informações ainda não estão disponíveis. Tente novamente mais tarde.');
+  if (response.status === 429) throw new Error('Muitas tentativas seguidas. Aguarde um instante e tente novamente.');
+  if (response.status === 503) throw new Error('A API está a reiniciar. Tente novamente dentro de alguns segundos.');
   if (!response.ok) throw new Error('Não foi possível atualizar os dados. Tente novamente daqui a pouco.');
   try {
     return await response.json();
