@@ -369,7 +369,7 @@ function App() {
         <div className="sidebar-bottom">
           <div className={`sync-card ${sync.status === 'error' ? 'sync-error' : ''}`}>
             <div className="sync-icon">{sync.status === 'loading' ? <RefreshCw size={17} className="spin" /> : <Cloud size={17} />}</div>
-            <div><strong>{syncCopy.title}</strong><small>{syncCopy.hint}</small></div>
+            <div><strong>{syncCopy.title}</strong><small>{sync.status === 'error' && sync.error ? sync.error : syncCopy.hint}</small></div>
             <span className={`status-dot ${syncCopy.dot}`} />
           </div>
           {sync.status !== 'live' && <button className="nav-item sync-retry" onClick={() => syncDashboard()}><RefreshCw size={16} /><span>Tentar novamente</span></button>}
