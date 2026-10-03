@@ -14,12 +14,14 @@ import {
   Inbox,
   LogOut,
   Menu,
+  Moon,
   MoreHorizontal,
   Plus,
   RefreshCw,
   Search,
   Settings,
   Sparkles,
+  Sun,
   UserRound,
   UsersRound,
   WifiOff,
@@ -168,6 +170,7 @@ function App() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [theme, setTheme] = useState(() => localStorage.getItem('icea-theme') === 'dark' ? 'dark' : 'light');
   const [modal, setModal] = useState('');
   const [visitorRecords, setVisitorRecords] = useState([]);
   const [attendanceRecords, setAttendanceRecords] = useState([]);
@@ -177,6 +180,11 @@ function App() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => localStorage.getItem('icea-notifications') !== 'false');
   const [dashboard, setDashboard] = useState(EMPTY_DASHBOARD);
   const [sync, setSync] = useState({ status: 'loading', savedAt: 0, error: '' });
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem('icea-theme', theme);
+  }, [theme]);
 
   useEffect(() => {
     let unsubscribeProfile = () => {};
@@ -385,8 +393,9 @@ function App() {
           <button className="icon-button menu-trigger" onClick={() => setMobileOpen(true)} aria-label="Abrir menu"><Menu size={21} /></button>
           <div className="breadcrumbs"><span>ICEA</span><i>/</i><strong>{active}</strong></div>
           <div className="topbar-actions">
-            <div className={`search-wrap ${searchOpen ? 'search-visible' : ''}`}><Search size={18} /><input autoFocus={searchOpen} value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Pesquisar..." aria-label="Pesquisar" /></div>
-            <button className="icon-button search-trigger" onClick={() => setSearchOpen((open) => !open)} aria-label="Pesquisar"><Search size={19} /></button>
+            {searchOpen && <div className="search-wrap search-visible"><Search size={18} /><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Pesquisar..." aria-label="Pesquisar" /></div>}
+            <button className="icon-button search-trigger" onClick={() => setSearchOpen((open) => !open)} aria-label={searchOpen ? 'Fechar pesquisa' : 'Pesquisar'} title={searchOpen ? 'Fechar pesquisa' : 'Pesquisar'}>{searchOpen ? <X size={19} /> : <Search size={19} />}</button>
+            <button className="icon-button theme-toggle" onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')} aria-label={theme === 'dark' ? 'Ativar modo claro' : 'Ativar modo escuro'} title={theme === 'dark' ? 'Modo claro' : 'Modo escuro'}>{theme === 'dark' ? <Sun size={19} /> : <Moon size={19} />}</button>
             {isAdmin && <button className="icon-button notification-button" onClick={() => setModal('notifications')} aria-label="Notificações"><Bell size={19} />{notificationsEnabled && <span />}</button>}
             <div className="top-avatar"><UserRound size={15} /></div>
           </div>
