@@ -71,7 +71,7 @@ function sessionDate(session) {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-function attendanceSeries(sessions, period) {
+function attendanceSeries(sessions, period, attendanceRecords = [], members = []) {
   const now = new Date();
   const year = now.getFullYear();
   const month = now.getMonth();
@@ -94,11 +94,31 @@ function attendanceSeries(sessions, period) {
   }
 
   const todayEnd = new Date(year, month, now.getDate(), 23, 59, 59).getTime();
+
+  attendanceRecords.forEach((rec) => {
+    const ds = rec.sessionDate || (rec.createdAt?.toDate?.() ? rec.createdAt.toDate().toISOString().slice(0, 10) : '');
+    if (!ds) return;
+    const date = new Date(ds + 'T00:00:00');
+    if (Number.isNaN(date.getTime()) || date.getTime() > todayEnd) return;
+    let index = -1;
+    if (period === 'Este mês' && date.getFullYear() === year && date.getMonth() === month) index = Math.floor((date.getDate() - 1) / 7);
+    if (period === 'Últimos 3 meses') index = points.findIndex((point) => point.year === date.getFullYear() && point.month === date.getMonth());
+    if (period === 'Este ano' && date.getFullYear() === year) index = date.getMonth();
+    if (index < 0 || !points[index]) return;
+    const attendance = rec.attendance || [];
+    const present = attendance.filter((a) => a.status === 'Presente').length;
+    const enrolled = attendance.length || members.filter((m) => String(m.class_id) === String(rec.classId)).length || 0;
+    if (!Number.isFinite(present)) return;
+    if (enrolled <= 0 && members.length > 0) return;
+    points[index].present += present;
+    points[index].enrolled += Math.max(enrolled, present);
+    points[index].sessions += 1;
+  });
+
   sessions.forEach((session) => {
     const date = sessionDate(session);
     if (!date || date.getTime() > todayEnd) return;
     let index = -1;
-    
     if (period === 'Este mês' && date.getFullYear() === year && date.getMonth() === month) index = Math.floor((date.getDate() - 1) / 7);
     if (period === 'Últimos 3 meses') index = points.findIndex((point) => point.year === date.getFullYear() && point.month === date.getMonth());
     if (period === 'Este ano' && date.getFullYear() === year) index = date.getMonth();
@@ -106,6 +126,7 @@ function attendanceSeries(sessions, period) {
     const present = Number(session.presencas ?? session.presentes ?? 0);
     const enrolled = Number(session.matriculados ?? session.total_matriculados ?? 0);
     if (!Number.isFinite(present) || !Number.isFinite(enrolled) || enrolled <= 0) return;
+    if (points[index].sessions > 0 && points[index].enrolled > 0) return;
     points[index].present += present;
     points[index].enrolled += enrolled;
     points[index].sessions += 1;
@@ -153,6 +174,26 @@ function relativeTime(timestamp) {
 
 function initialsOf(name) {
   return String(name || '').split(' ').map((part) => part[0]).slice(0, 2).join('').toUpperCase();
+}
+
+function getNextSunday(date = new Date()) {
+  const d = new Date(date);
+  const day = d.getDay();
+  const add = day === 0 ? 7 : 7 - day;
+  const ns = new Date(d);
+  ns.setDate(d.getDate() + add);
+  ns.setHours(0, 0, 0, 0);
+  const y = ns.getFullYear();
+  const m = String(ns.getMonth() + 1).padStart(2, '0');
+  const da = String(ns.getDate()).padStart(2, '0');
+  return `${y}-${m}-${da}`;
+}
+
+function formatDatePt(iso) {
+  if (!iso) return '';
+  const [y, m, d] = String(iso).slice(0, 10).split('-');
+  if (!y || !m || !d) return iso;
+  return `${d}/${m}/${y}`;
 }
 
 const SYNC_COPY = {
@@ -335,7 +376,7 @@ function App() {
   ], [stats, members.length, sessions.length, classes.length, visitors.length]);
 
   const getClassName = (classId) => classes.find((item) => item.id === classId)?.name || 'Sem turma';
-  const attendance = useMemo(() => attendanceSeries(sessions, period), [sessions, period]);
+  const attendance = useMemo(() => attendanceSeries(sessions, period, attendanceRecords, members), [sessions, period, attendanceRecords, members]);
   const syncCopy = SYNC_COPY[sync.status];
   const toggleNotifications = () => {
     if (!isAdmin) return;
@@ -377,10 +418,10 @@ function App() {
     setNotice(`Ficheiro de ${type.toLocaleLowerCase('pt-PT')} exportado.`);
   }
 
-  async function saveAttendance(classId, selectedIds) {
+  async function saveAttendance(classId, selectedIds, sessionDate) {
     if (!isAdmin) return;
     try {
-      await addAttendanceRecord(classId, visibleMembers, selectedIds, authSession.user);
+      await addAttendanceRecord(classId, visibleMembers, selectedIds, authSession.user, sessionDate);
       setModal('');
       setNotice('Presenças guardadas.');
     } catch (error) {
@@ -526,7 +567,28 @@ function WorkspacePage({ active, classes, members, visitors, sessions, getClassN
 
   if (active === 'Pessoas') return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Comunidade</span><h1>Pessoas</h1><p>{members.length || visitors.length ? `${plural(members.length, 'pessoa registada', 'pessoas registadas')} e ${plural(visitors.length, 'visitante', 'visitantes')}` : 'Ainda não há pessoas para mostrar'}</p></div><div className="workspace-actions"><button className="outline-button export-button" onClick={() => onExport('Pessoas')} disabled={!members.length}><Download size={16} /> Exportar</button><button className="primary-button" onClick={onAddVisitor}><Plus size={16} /> Visitante</button></div></div>{members.length ? <div className="panel workspace-table"><div className="workspace-table-head"><span>Nome</span><span>Turma</span><span>Estado</span></div>{members.map((person) => <div className="workspace-table-row" key={person.id}><strong>{person.name}</strong><span>{getClassName(person.class_id)}</span><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Ainda não há pessoas para mostrar" hint="Se esperava ver nomes, atualize os dados. Se continuar, peça ajuda ao responsável." />}<h2 className="workspace-subheading">Visitantes</h2>{visitors.length ? <div className="panel workspace-table">{visitors.map((visitor) => <div className="workspace-table-row visitor-table-row" key={visitor.id}><strong>{visitor.name}</strong><span>{visitor.className || 'Visitante'}</span><span>{visitor.date || 'Data indisponível'}</span></div>)}</div> : <EmptyState icon={Sparkles} title="Ainda não há visitantes para mostrar" hint="Os visitantes aparecerão aqui quando forem registados." />}</section>;
 
-  if (active === 'Presenças') return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Acompanhamento</span><h1>Presenças</h1><p>Estado atual das pessoas por turma</p></div><button className="primary-button" onClick={onAttendance} disabled={!members.length}><Plus size={16} /> Registar presença</button></div>{classes.length && members.length ? classes.map((item) => <section className="panel attendance-class" key={item.id}><div className="panel-heading"><div><span className="section-kicker">Turma</span><h2>{item.name}</h2></div><span className="attendance-count">{members.filter((person) => person.class_id === item.id && person.status === 'Presente').length}/{members.filter((person) => person.class_id === item.id).length} presentes</span></div>{members.filter((person) => person.class_id === item.id).map((person) => <div className="attendance-person" key={person.id}><div className="avatar">{person.initials || initialsOf(person.name)}</div><strong>{person.name}</strong><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span></div>)}</section>) : <EmptyState icon={BookOpen} title="Sem dados de presença" hint="São necessárias turmas e pessoas para listar as presenças." />}</section>;
+  if (active === 'Presenças') {
+    const records = attendanceRecords.slice().sort((a, b) => {
+      const da = a.sessionDate || a.createdAt?.toDate?.()?.toISOString?.() || '';
+      const db = b.sessionDate || b.createdAt?.toDate?.()?.toISOString?.() || '';
+      return db.localeCompare(da);
+    });
+    return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Acompanhamento</span><h1>Presenças</h1><p>Registos de presença por data de sessão</p></div><button className="primary-button" onClick={onAttendance} disabled={!members.length}><Plus size={16} /> Registar presença</button></div>
+      {records.length ? records.map((rec) => {
+        const sessDate = rec.sessionDate || (rec.createdAt?.toDate?.() ? rec.createdAt.toDate().toISOString().slice(0,10) : '');
+        const turmas = classes.filter((c) => String(c.id) === String(rec.classId));
+        const turmaNome = turmas[0]?.name || rec.className || rec.classId;
+        const items = (rec.attendance || []).map((e) => {
+          const m = members.find((mm) => String(mm.id) === String(e.memberId));
+          return { ...e, name: m?.name || e.memberId };
+        });
+        return <section className="panel attendance-class" key={rec.id} style={{ marginBottom: 16 }}>
+          <div className="panel-heading"><div><span className="section-kicker">Sessão</span><h2>{turmaNome} · {formatDatePt(sessDate) || 'Data não indicada'}</h2></div><span className="attendance-count">{items.filter((i) => i.status === 'Presente').length}/{items.length} presentes</span></div>
+          {items.map((i) => <div className="attendance-person" key={i.memberId}><div className="avatar">{initialsOf(i.name)}</div><strong>{i.name}</strong><span className={`presence ${i.status === 'Ausente' ? 'absent' : 'present'}`}><i />{i.status}</span></div>)}
+        </section>;
+      }) : <EmptyState icon={BookOpen} title="Sem registos de presença" hint="Registe presenças para cada domingo/turma. Os registos aparecem aqui agrupados por data." />}
+    </section>;
+  }
 
   if (active === 'Calendário') return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Agenda</span><h1>Calendário</h1><p>{sessions.length ? plural(sessions.length, 'sessão recebida', 'sessões recebidas') : 'Sem dados recebidos'}</p></div></div>{sessions.length ? <div className="workspace-list">{sessions.map((session, index) => <article className="workspace-row" key={session.id || index}><div className="class-badge sky"><CalendarDays size={17} /></div><div className="workspace-row-copy"><strong>{session.name || session.turma || session.class_name || `Sessão ${index + 1}`}</strong><small>{session.date || session.data || session.start || 'Data não indicada'}</small></div><span>{session.time || session.hora || ''}</span></article>)}</div> : <EmptyState icon={CalendarDays} title="Ainda não há sessões para mostrar" hint="As próximas sessões aparecerão aqui quando forem registadas." />}</section>;
 
@@ -536,15 +598,16 @@ function WorkspacePage({ active, classes, members, visitors, sessions, getClassN
 function ActionDialog({ type, classes, members, onClose, onSaveAttendance, onSaveVisitor, notificationsEnabled, onToggleNotifications, user, profile, onSignOut }) {
   const [selectedClass, setSelectedClass] = useState(classes[0]?.id ?? '');
   const [selectedMembers, setSelectedMembers] = useState([]);
+  const [sessionDate, setSessionDate] = useState(getNextSunday());
   const classMembers = members.filter((person) => String(person.class_id) === String(selectedClass));
 
   useEffect(() => {
-    setSelectedMembers(members.filter((person) => person.class_id === selectedClass && person.status === 'Presente').map((person) => person.id));
-  }, [selectedClass]);
+    setSelectedMembers([]);
+  }, [selectedClass, sessionDate]);
 
   function submitAttendance(event) {
     event.preventDefault();
-    onSaveAttendance(selectedClass, selectedMembers);
+    onSaveAttendance(selectedClass, selectedMembers, sessionDate);
   }
 
   function submitVisitor(event) {
@@ -556,7 +619,13 @@ function ActionDialog({ type, classes, members, onClose, onSaveAttendance, onSav
   const titleMap = { attendance: 'Registar presenças', visitor: 'Adicionar visitante', notifications: 'Notificações', profile: 'Perfil' };
 
   return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="action-dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><div className="dialog-heading"><h2 id="dialog-title">{titleMap[type] ?? 'Diálogo'}</h2><button className="icon-button" onClick={onClose} aria-label="Fechar"><X size={18} /></button></div>
-    {type === 'attendance' && <form onSubmit={submitAttendance}><label className="form-field">Turma<select value={selectedClass} onChange={(event) => setSelectedClass(event.target.value)}>{classes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>{classMembers.length ? <div className="attendance-checklist">{classMembers.map((person) => <label className="check-row" key={person.id}><input type="checkbox" checked={selectedMembers.includes(person.id)} onChange={(event) => setSelectedMembers((current) => event.target.checked ? [...current, person.id] : current.filter((id) => id !== person.id))} /><span>{person.name}</span></label>)}</div> : <p className="dialog-note">Esta turma ainda não tem pessoas registadas.</p>}<p className="dialog-note">As presenças serão guardadas e ficarão disponíveis no painel.</p><button className="primary-button dialog-submit" type="submit" disabled={!classMembers.length}><Check size={16} /> Guardar presenças</button></form>}
+    {type === 'attendance' && <form onSubmit={submitAttendance}>
+      <label className="form-field">Turma<select value={selectedClass} onChange={(event) => setSelectedClass(event.target.value)}>{classes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
+      <label className="form-field">Data da sessão<input type="date" value={sessionDate} onChange={(event) => setSessionDate(event.target.value)} /></label>
+      {classMembers.length ? <div className="attendance-checklist">{classMembers.map((person) => <label className="check-row" key={person.id}><input type="checkbox" checked={selectedMembers.includes(person.id)} onChange={(event) => setSelectedMembers((current) => event.target.checked ? [...current, person.id] : current.filter((id) => id !== person.id))} /><span>{person.name}</span></label>)}</div> : <p className="dialog-note">Esta turma ainda não tem pessoas registadas.</p>}
+      <p className="dialog-note">As presenças serão guardadas e ficarão disponíveis no painel.</p>
+      <button className="primary-button dialog-submit" type="submit"><Check size={16} /> Guardar presenças</button>
+    </form>}
     {type === 'visitor' && <form onSubmit={submitVisitor}><label className="form-field">Nome<input name="name" required autoFocus placeholder="Nome completo" /></label><label className="form-field">Turma de acolhimento<select name="className"><option value="Visitante">Sem turma</option>{classes.map((item) => <option key={item.id} value={item.name}>{item.name}</option>)}</select></label><p className="dialog-note">O visitante será guardado e ficará disponível no painel.</p><button className="primary-button dialog-submit" type="submit"><Plus size={16} /> Guardar visitante</button></form>}
     {type === 'notifications' && <div className="dialog-copy"><p>O indicador de notificações está {notificationsEnabled ? 'ativo' : 'inativo'} nas definições locais.</p><button className="outline-button" onClick={onToggleNotifications}>{notificationsEnabled ? 'Desativar' : 'Ativar'} notificações</button></div>}
     {type === 'profile' && <div className="dialog-copy"><div className="profile-dialog-avatar"><UserRound size={22} /></div><strong>{profile?.displayName || user?.displayName || user?.email}</strong><p>{profile?.status === 'admin' ? 'Administrador com acesso de gestão.' : 'Utilizador com acesso apenas de leitura.'}</p><button className="outline-button" onClick={onSignOut}>Terminar sessão</button></div>}

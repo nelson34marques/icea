@@ -127,7 +127,7 @@ export function addVisitorRecord(visitor, user) {
   });
 }
 
-export function addAttendanceRecord(classId, members, selectedIds, user) {
+export function addAttendanceRecord(classId, members, selectedIds, user, sessionDate) {
   const attendance = members
     .filter((person) => String(person.class_id) === String(classId))
     .map((person) => ({
@@ -138,6 +138,7 @@ export function addAttendanceRecord(classId, members, selectedIds, user) {
   return addDoc(collection(db, 'attendance'), {
     classId: String(classId),
     attendance,
+    sessionDate: sessionDate || null,
     createdAt: serverTimestamp(),
     createdBy: user.uid,
   });
