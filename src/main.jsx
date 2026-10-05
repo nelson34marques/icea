@@ -178,8 +178,24 @@ function App() {
   const [period, setPeriod] = useState('Este mês');
   const [notice, setNotice] = useState('');
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => localStorage.getItem('icea-notifications') !== 'false');
-  const [dashboard, setDashboard] = useState(EMPTY_DASHBOARD);
-  const [sync, setSync] = useState({ status: 'loading', savedAt: 0, error: '' });
+  const [dashboard, setDashboard] = useState(() => {
+    try {
+      const cached = localStorage.getItem('icea-dashboard-cache');
+      return cached ? JSON.parse(cached) : EMPTY_DASHBOARD;
+    } catch {
+      return EMPTY_DASHBOARD;
+    }
+  });
+  const [sync, setSync] = useState(() => {
+    const hasCache = (() => {
+      try {
+        return !!localStorage.getItem('icea-dashboard-cache');
+      } catch {
+        return false;
+      }
+    })();
+    return hasCache ? { status: 'live', savedAt: 0, error: '' } : { status: 'loading', savedAt: 0, error: '' };
+  });
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -191,12 +207,28 @@ function App() {
     const unsubscribeAuth = subscribeToAuthState((user) => {
       unsubscribeProfile();
       if (!user) {
-        setDashboard(EMPTY_DASHBOARD);
+        setDashboard(() => {
+        try {
+          const cached = localStorage.getItem('icea-dashboard-cache');
+          return cached ? JSON.parse(cached) : EMPTY_DASHBOARD;
+        } catch {
+          return EMPTY_DASHBOARD;
+        }
+      });
         setVisitorRecords([]);
         setAttendanceRecords([]);
         setAttendanceStatus({});
         setModal('');
-        setSync({ status: 'loading', savedAt: 0, error: '' });
+        setSync(() => {
+          const hasCache = (() => {
+            try {
+              return !!localStorage.getItem('icea-dashboard-cache');
+            } catch {
+              return false;
+            }
+          })();
+          return hasCache ? { status: 'live', savedAt: 0, error: '' } : { status: 'loading', savedAt: 0, error: '' };
+        });
         setAuthSession({ loading: false, user: null, profile: null, error: '' });
         return;
       }
@@ -235,9 +267,22 @@ function App() {
     try {
       const data = await api.getDashboard();
       setDashboard(data);
+      try {
+        localStorage.setItem('icea-dashboard-cache', JSON.stringify(data));
+      } catch {}
       setSync({ status: 'live', savedAt: Date.now(), error: '' });
     } catch (error) {
-      setDashboard(EMPTY_DASHBOARD);
+      const hasExisting = (() => {
+        try {
+          const cached = localStorage.getItem('icea-dashboard-cache');
+          return cached && cached.length > 0;
+        } catch {
+          return false;
+        }
+      })();
+      if (!hasExisting) {
+        setDashboard(EMPTY_DASHBOARD);
+      }
       setSync({ status: 'error', savedAt: 0, error: error.message });
     }
   }, []);
