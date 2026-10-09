@@ -567,7 +567,7 @@ function App() {
             </div>
             <div className="welcome-actions">
               <button className="outline-button refresh-button" onClick={() => syncDashboard()} disabled={sync.status === 'loading'}><RefreshCw size={16} /> Sincronizar</button>
-              {isAdmin && <button className="primary-button" onClick={() => setModal('attendance')} disabled={!members.length}><Plus size={17} /> Registar presença</button>}
+              {isAdmin && active !== 'Presenças' && <button className="primary-button" onClick={() => setModal('attendance')} disabled={!members.length}><Plus size={17} /> Registar presença</button>}
               {isAdmin && <button className="outline-button" onClick={() => setModal('member')}><Plus size={17} /> Aluno</button>}
             </div>
           </section>
