@@ -33,6 +33,15 @@ function firstValue(...candidates) {
   return candidates.find((candidate) => candidate !== undefined && candidate !== null && candidate !== '');
 }
 
+function statusMessage(status, fallback) {
+  if (status === 401) return 'Sessão expirada ou não autorizada. Inicie sessão novamente.';
+  if (status === 403) return 'A sua conta não tem permissão para aceder a estes dados.';
+  if (status === 404) return 'Algumas informações ainda não estão disponíveis. Tente novamente mais tarde.';
+  if (status === 429) return 'Muitas tentativas seguidas. Aguarde um instante e tente novamente.';
+  if (status === 503) return 'A API está a reiniciar. Tente novamente dentro de alguns segundos.';
+  return fallback;
+}
+
 async function request(path) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
@@ -52,17 +61,45 @@ async function request(path) {
     clearTimeout(timeout);
   }
 
-  if (response.status === 401) throw new Error('Sessão expirada ou não autorizada. Inicie sessão novamente.');
-  if (response.status === 403) throw new Error('A sua conta não tem permissão para aceder a estes dados.');
-  if (response.status === 404) throw new Error('Algumas informações ainda não estão disponíveis. Tente novamente mais tarde.');
-  if (response.status === 429) throw new Error('Muitas tentativas seguidas. Aguarde um instante e tente novamente.');
-  if (response.status === 503) throw new Error('A API está a reiniciar. Tente novamente dentro de alguns segundos.');
-  if (!response.ok) throw new Error('Não foi possível atualizar os dados. Tente novamente daqui a pouco.');
+  if (!response.ok) throw new Error(statusMessage(response.status, 'Não foi possível atualizar os dados. Tente novamente daqui a pouco.'));
   try {
     return await response.json();
   } catch {
     throw new Error('Recebemos uma resposta inesperada. Tente novamente mais tarde.');
   }
+}
+
+async function enviar(path, corpo) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+  let response;
+  try {
+    const authHeaders = await authHeader();
+    response = await fetch(`${API_URL}${path}`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...authHeaders },
+      body: JSON.stringify(corpo),
+    });
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error('A gravação está a demorar mais do que o normal. Tente novamente.');
+    if (error?.sessao) throw error;
+    throw new Error('Não foi possível guardar. Verifique a ligação e tente novamente.');
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) {
+    throw new Error(payload?.erro || statusMessage(response.status, 'Não foi possível guardar. Tente novamente daqui a pouco.'));
+  }
+  return payload;
 }
 
 async function fetchSessions() {
@@ -90,35 +127,63 @@ function normalizeMembers(payload) {
   });
 }
 
-async function fetchVisitors(sessions) {
-  const completeSessions = await Promise.all(sessions.map(async (session) => {
-    if (!session.id) return session;
-    try {
-      return await request(`/sessions/${encodeURIComponent(session.id)}`);
-    } catch {
-      return session;
-    }
-  }));
-
-  return completeSessions.flatMap((session) => (session.visitantes || session.visitors || []).map((visitor) => {
+async function fetchVisitors() {
+  return listFrom(await request('/visitors'), 'visitors').map((visitor) => {
     const name = firstValue(visitor.name, visitor.nome) || 'Visitante sem nome';
     return {
       ...visitor,
       name,
       initials: firstValue(visitor.initials, visitor.iniciais) || initialsOf(name),
-      date: formatDate(firstValue(visitor.date, visitor.data, session.date, session.data)),
-      className: firstValue(visitor.className, visitor.turma, session.class_name, session.turma) || 'Visitante',
+      date: formatDate(firstValue(visitor.date, visitor.data)),
+      className: firstValue(visitor.className, visitor.turma) || 'Visitante',
+      classId: firstValue(visitor.classId, visitor.class_id),
     };
+  });
+}
+
+async function fetchAttendance() {
+  return listFrom(await request('/attendance'), 'attendance').map((record) => ({
+    ...record,
+    classId: firstValue(record.classId, record.class_id),
+    sessionDate: firstValue(record.sessionDate, record.session_date, record.date),
+    attendance: Array.isArray(record.attendance) ? record.attendance : [],
   }));
+}
+
+async function fetchMemberPhoto(memberId) {
+  const authHeaders = await authHeader();
+  let response;
+  try {
+    response = await fetch(`${API_URL}/members/${encodeURIComponent(memberId)}/photo`, {
+      headers: { Accept: 'application/json', ...authHeaders },
+    });
+  } catch {
+    throw new Error('Não foi possível carregar a foto. Verifique a ligação.');
+  }
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(statusMessage(response.status, 'Não foi possível carregar a foto.'));
+  try {
+    const payload = await response.json();
+    return payload?.photo || null;
+  } catch {
+    throw new Error('Recebemos uma resposta inesperada ao carregar a foto.');
+  }
+}
+
+async function fetchMemberPhotos() {
+  const payload = await request('/members/photos');
+  return payload && !Array.isArray(payload) && typeof payload === 'object' ? payload : {};
 }
 
 export const api = {
   async getDashboard() {
-    const [stats, classes, members, sessions] = await Promise.all([
+    const [stats, classes, members, sessions, visitors, attendanceRecords] = await Promise.all([
       request('/stats'),
       request('/classes').then(normalizeClasses),
       request('/members').then(normalizeMembers),
       fetchSessions(),
+      fetchVisitors(),
+      fetchAttendance(),
     ]);
 
     return {
@@ -126,7 +191,32 @@ export const api = {
       classes,
       members,
       sessions,
-      visitors: await fetchVisitors(sessions),
+      visitors,
+      attendanceRecords,
     };
+  },
+
+  criarVisitante({ name, classId, date }) {
+    return enviar('/visitors', { name, classId, date });
+  },
+
+  criarAluno({ name, birth_date }) {
+    return enviar('/members', { name, birth_date, role: 'Aluno' });
+  },
+
+  guardarPresencas({ classId, date, attendance }) {
+    return enviar('/attendance', { classId, date, attendance });
+  },
+
+  guardarFoto(memberId, photo) {
+    return enviar(`/members/${encodeURIComponent(memberId)}/photo`, { photo });
+  },
+
+  carregarFoto(memberId) {
+    return fetchMemberPhoto(memberId);
+  },
+
+  carregarFotos() {
+    return fetchMemberPhotos();
   },
 };

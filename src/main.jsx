@@ -4,6 +4,7 @@ import {
   Bell,
   BookOpen,
   CalendarDays,
+  Camera,
   Check,
   ChevronDown,
   CircleAlert,
@@ -31,11 +32,8 @@ import { createRoot } from 'react-dom/client';
 import AuthScreen from './AuthScreen';
 import { useInstallPrompt, useOnline, useServiceWorker } from './hooks/usePwa';
 import { api } from './services/api';
+import { reduzirFoto } from './services/fotos';
 import {
-
-  
-  addAttendanceRecord,
-  addVisitorRecord,
   signOutUser,
   subscribeToAttendanceRecords,
   subscribeToAuthState,
@@ -62,7 +60,41 @@ const navItems = [
 
 const statIcons = { users: UsersRound, chart: BarChart3, book: BookOpen, sparkles: Sparkles };
 
-const EMPTY_DASHBOARD = { stats: {}, classes: [], members: [], sessions: [], visitors: [] };
+const EMPTY_DASHBOARD = { stats: {}, classes: [], members: [], sessions: [], visitors: [], attendanceRecords: [] };
+
+function dateKey(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const iso = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) return `${iso[1]}-${String(iso[2]).padStart(2, '0')}-${String(iso[3]).padStart(2, '0')}`;
+  const br = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (br) return `${br[3]}-${String(br[2]).padStart(2, '0')}-${String(br[1]).padStart(2, '0')}`;
+  return raw;
+}
+
+function mergeAttendance(apiRecords = [], legacyRecords = []) {
+  const merged = [];
+  const seen = new Set();
+  [...apiRecords, ...legacyRecords].forEach((record) => {
+    const key = `${record.classId ?? record.class_id ?? ''}|${dateKey(record.sessionDate ?? record.session_date ?? record.date)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push(record);
+  });
+  return merged;
+}
+
+function mergeVisitors(apiVisitors = [], legacyVisitors = []) {
+  const merged = [];
+  const seen = new Set();
+  [...apiVisitors, ...legacyVisitors].forEach((visitor) => {
+    const key = `${String(visitor.name || '').trim().toLocaleLowerCase('pt-PT')}|${dateKey(visitor.date)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push(visitor);
+  });
+  return merged;
+}
 
 function sessionDate(session) {
   const match = String(session.date || session.data || '').match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
@@ -176,24 +208,16 @@ function initialsOf(name) {
   return String(name || '').split(' ').map((part) => part[0]).slice(0, 2).join('').toUpperCase();
 }
 
-function getNextSunday(date = new Date()) {
-  const d = new Date(date);
-  const day = d.getDay();
-  const add = day === 0 ? 7 : 7 - day;
-  const ns = new Date(d);
-  ns.setDate(d.getDate() + add);
-  ns.setHours(0, 0, 0, 0);
-  const y = ns.getFullYear();
-  const m = String(ns.getMonth() + 1).padStart(2, '0');
-  const da = String(ns.getDate()).padStart(2, '0');
-  return `${y}-${m}-${da}`;
-}
-
 function formatDatePt(iso) {
   if (!iso) return '';
   const [y, m, d] = String(iso).slice(0, 10).split('-');
   if (!y || !m || !d) return iso;
   return `${d}/${m}/${y}`;
+}
+
+function hojeIso() {
+  const agora = new Date();
+  return `${agora.getFullYear()}-${String(agora.getMonth() + 1).padStart(2, '0')}-${String(agora.getDate()).padStart(2, '0')}`;
 }
 
 const SYNC_COPY = {
@@ -213,8 +237,11 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [theme, setTheme] = useState(() => localStorage.getItem('icea-theme') === 'dark' ? 'dark' : 'light');
   const [modal, setModal] = useState('');
-  const [visitorRecords, setVisitorRecords] = useState([]);
-  const [attendanceRecords, setAttendanceRecords] = useState([]);
+  const [fotos, setFotos] = useState({});
+  const [fotosCarregadas, setFotosCarregadas] = useState(false);
+  const [alvoFoto, setAlvoFoto] = useState(null);
+  const [legacyVisitorRecords, setLegacyVisitorRecords] = useState([]);
+  const [legacyAttendanceRecords, setLegacyAttendanceRecords] = useState([]);
   const [attendanceStatus, setAttendanceStatus] = useState({});
   const [period, setPeriod] = useState('Este mês');
   const [notice, setNotice] = useState('');
@@ -256,8 +283,8 @@ function App() {
           return EMPTY_DASHBOARD;
         }
       });
-        setVisitorRecords([]);
-        setAttendanceRecords([]);
+        setLegacyVisitorRecords([]);
+        setLegacyAttendanceRecords([]);
         setAttendanceStatus({});
         setModal('');
         setSync(() => {
@@ -292,8 +319,8 @@ function App() {
     if (!authSession.user || authSession.loading) return undefined;
 
     const onReadError = () => setNotice('Não foi possível atualizar as listas. Tente novamente daqui a pouco.');
-    const unsubscribeVisitors = subscribeToVisitorRecords(setVisitorRecords, onReadError);
-    const unsubscribeAttendance = subscribeToAttendanceRecords(setAttendanceRecords, onReadError);
+    const unsubscribeVisitors = subscribeToVisitorRecords(setLegacyVisitorRecords, onReadError);
+    const unsubscribeAttendance = subscribeToAttendanceRecords(setLegacyAttendanceRecords, onReadError);
     return () => {
       unsubscribeVisitors();
       unsubscribeAttendance();
@@ -342,7 +369,14 @@ function App() {
   const members = dashboard.members ?? [];
   const sessions = dashboard.sessions ?? [];
   const stats = dashboard.stats ?? {};
-  const visitors = [...visitorRecords, ...(dashboard.visitors ?? [])];
+  const visitors = useMemo(
+    () => mergeVisitors(dashboard.visitors ?? [], legacyVisitorRecords),
+    [dashboard.visitors, legacyVisitorRecords],
+  );
+  const attendanceRecords = useMemo(
+    () => mergeAttendance(dashboard.attendanceRecords ?? [], legacyAttendanceRecords),
+    [dashboard.attendanceRecords, legacyAttendanceRecords],
+  );
   const visibleMembers = members.map((person) => ({ ...person, status: attendanceStatus[person.id] || person.status }));
   const isBootLoading = sync.status === 'loading' && !classes.length && !members.length && !sessions.length && !visitors.length;
   const hasNoData = !classes.length && !members.length && !sessions.length && !visitors.length;
@@ -418,25 +452,62 @@ function App() {
     setNotice(`Ficheiro de ${type.toLocaleLowerCase('pt-PT')} exportado.`);
   }
 
-  async function saveAttendance(classId, selectedIds, sessionDate) {
+  useEffect(() => {
+    if (!authSession.user || authSession.loading || fotosCarregadas) return undefined;
+    let cancelado = false;
+    api.carregarFotos()
+      .then((mapa) => { if (!cancelado) { setFotos(mapa || {}); setFotosCarregadas(true); } })
+      .catch(() => { if (!cancelado) setFotosCarregadas(true); });
+    return () => { cancelado = true; };
+  }, [authSession.user, authSession.loading, fotosCarregadas]);
+
+  async function guardarVisitante(dados) {
     if (!isAdmin) return;
-    try {
-      await addAttendanceRecord(classId, visibleMembers, selectedIds, authSession.user, sessionDate);
-      setModal('');
-      setNotice('Presenças guardadas.');
-    } catch (error) {
-      setNotice('Não foi possível guardar as presenças. Verifique a ligação e tente novamente.');
+    await api.criarVisitante(dados);
+    setModal('');
+    setNotice('Visitante registado.');
+    await syncDashboard({ silent: true });
+  }
+
+  async function guardarAluno(dados) {
+    if (!isAdmin) return;
+    const criado = await api.criarAluno(dados);
+    setModal('');
+    setNotice(criado?.turma ? `Aluno registado na turma ${criado.turma}.` : 'Aluno registado.');
+    await syncDashboard({ silent: true });
+  }
+
+  async function guardarPresencas(dados) {
+    if (!isAdmin) return;
+    await api.guardarPresencas(dados);
+    setModal('');
+    setNotice('Presenças registadas.');
+    await syncDashboard({ silent: true });
+  }
+
+  function escolherFoto(memberId) {
+    if (!isAdmin) return;
+    setAlvoFoto(memberId);
+    const input = document.getElementById('input-foto');
+    if (input) {
+      input.value = '';
+      input.click();
     }
   }
 
-  async function saveVisitor(visitor) {
-    if (!isAdmin) return;
+  async function aoEscolherFoto(event) {
+    const ficheiro = event.target.files?.[0];
+    const membro = alvoFoto;
+    setAlvoFoto(null);
+    if (!ficheiro || !membro || !isAdmin) return;
     try {
-      await addVisitorRecord(visitor, authSession.user);
-      setModal('');
-      setNotice('Visitante guardado.');
+      setNotice('A preparar a foto...');
+      const foto = await reduzirFoto(ficheiro);
+      await api.guardarFoto(membro, foto);
+      setFotos((current) => ({ ...current, [membro]: foto }));
+      setNotice('Foto guardada.');
     } catch (error) {
-      setNotice('Não foi possível guardar o visitante. Verifique a ligação e tente novamente.');
+      setNotice(error.message || 'Não foi possível guardar a foto.');
     }
   }
 
@@ -496,7 +567,8 @@ function App() {
             </div>
             <div className="welcome-actions">
               <button className="outline-button refresh-button" onClick={() => syncDashboard()} disabled={sync.status === 'loading'}><RefreshCw size={16} /> Sincronizar</button>
-              {isAdmin && <button className="primary-button" onClick={() => setModal('attendance')} disabled={!members.length}><Plus size={18} /> Registar presença</button>}
+              {isAdmin && <button className="primary-button" onClick={() => setModal('attendance')} disabled={!members.length}><Plus size={17} /> Registar presença</button>}
+              {isAdmin && <button className="outline-button" onClick={() => setModal('member')}><Plus size={17} /> Aluno</button>}
             </div>
           </section>
 
@@ -528,13 +600,15 @@ function App() {
           </section>
 
           <section className="bottom-grid">
-            <div className="panel people-panel"><div className="panel-heading"><div><span className="section-kicker">Últimos registos</span><h2>Pessoas recentes</h2></div>{isAdmin && <button className="icon-button" onClick={() => exportCsv('Pessoas')} disabled={!visibleMembers.length} aria-label="Exportar pessoas"><Download size={17} /></button>}</div>{visibleMembers.length ? <div className="people-table"><div className="table-head"><span>Pessoa</span><span>Turma</span><span>Estado</span></div>{visibleMembers.slice(0, 4).map((person) => <div className="person-row" key={person.id}><div className="person-name"><div className="avatar">{person.initials || initialsOf(person.name)}</div><strong>{person.name}</strong></div><span>{getClassName(person.class_id)}</span><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Ainda não há pessoas para mostrar" hint="Se esperava ver nomes, atualize os dados. Se continuar, peça ajuda ao responsável." />}</div>
+            <div className="panel people-panel"><div className="panel-heading"><div><span className="section-kicker">Últimos registos</span><h2>Pessoas recentes</h2></div>{isAdmin && <button className="icon-button" onClick={() => exportCsv('Pessoas')} disabled={!visibleMembers.length} aria-label="Exportar pessoas"><Download size={17} /></button>}</div>{visibleMembers.length ? <div className="people-table"><div className="table-head"><span>Pessoa</span><span>Turma</span><span>Estado</span></div>{visibleMembers.slice(0, 4).map((person) => <div className="person-row" key={person.id}><div className="person-name">{fotos[person.id] ? <img className="avatar avatar-photo" src={fotos[person.id]} alt="" /> : <div className="avatar">{person.initials || initialsOf(person.name)}</div>}<strong>{person.name}</strong></div><span>{getClassName(person.class_id)}</span><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Ainda não há pessoas para mostrar" hint="Se esperava ver nomes, atualize os dados. Se continuar, peça ajuda ao responsável." />}</div>
             <div className="panel visitors-panel"><div className="panel-heading"><div><span className="section-kicker">Acolhimento</span><h2>Visitantes recentes</h2></div><button className="text-button" onClick={() => setActive('Pessoas')}>Ver todos <span>↗</span></button></div>{visitors.length ? <div className="visitor-list">{visitors.slice(0, 3).map((visitor) => <div className="visitor-row" key={visitor.id}><div className="avatar visitor-avatar">{visitor.initials || initialsOf(visitor.name)}</div><div><strong>{visitor.name}</strong><small>{visitor.className || 'Visitante'}</small></div><time>{visitor.date || 'Data indisponível'}</time></div>)}</div> : <EmptyState icon={Sparkles} title="Sem visitantes registados" hint="Os visitantes aparecem aqui depois de uma sessão." />}{isAdmin && <button className="outline-button" onClick={() => setModal('visitor')}><Plus size={16} /> Adicionar visitante</button>}</div>
           </section>
-          </> : hasNoData ? <EmptyState icon={Inbox} title="Ainda não há dados para mostrar" hint="Atualize os dados. Se continuar sem informação, peça ajuda ao responsável." /> : <WorkspacePage active={active} classes={classes} members={visibleMembers} visitors={visitors} sessions={sessions} attendanceRecords={attendanceRecords} getClassName={getClassName} onExport={exportCsv} onAttendance={() => setModal('attendance')} onAddVisitor={() => setModal('visitor')} sync={sync} onSync={() => syncDashboard()} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} isAdmin={isAdmin} />}
+          </> : hasNoData ? <EmptyState icon={Inbox} title="Ainda não há dados para mostrar" hint="Atualize os dados. Se continuar sem informação, peça ajuda ao responsável." /> : <WorkspacePage active={active} classes={classes} members={visibleMembers} visitors={visitors} sessions={sessions} attendanceRecords={attendanceRecords} getClassName={getClassName} onExport={exportCsv} sync={sync} onSync={() => syncDashboard()} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} isAdmin={isAdmin} fotos={fotos} onPhoto={escolherFoto} onAttendance={() => setModal('attendance')} onVisitor={() => setModal('visitor')} onMember={() => setModal('member')} />}
         </div>
       </main>
-      {modal && <ActionDialog type={modal} classes={classes} members={visibleMembers} sessions={sessions} onClose={() => setModal('')} onSaveAttendance={saveAttendance} onSaveVisitor={saveVisitor} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} user={authSession.user} profile={authSession.profile} onSignOut={signOutUser} />}
+      {modal && <ActionDialog type={modal} classes={classes} members={visibleMembers} onClose={() => setModal('')} onSaveAttendance={guardarPresencas} onSaveVisitor={guardarVisitante} onSaveMember={guardarAluno} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} user={authSession.user} profile={authSession.profile} onSignOut={signOutUser} />}
+
+      <input id="input-foto" type="file" accept="image/*" className="input-foto-oculto" onChange={aoEscolherFoto} aria-label="Escolher foto do aluno" />
 
       <PwaBar online={online} canInstall={canInstall} onInstall={install} onDismissInstall={dismissInstall} updateReady={updateReady} onApplyUpdate={applyUpdate} />
     </div>
@@ -562,10 +636,22 @@ function DashboardSkeleton() {
   </div>;
 }
 
-function WorkspacePage({ active, classes, members, visitors, sessions, attendanceRecords = [], getClassName, onExport, onAttendance, onAddVisitor, sync, onSync, notificationsEnabled, onToggleNotifications, isAdmin }) {
+function WorkspacePage({ active, classes, members, visitors, sessions, attendanceRecords = [], getClassName, onExport, sync, onSync, notificationsEnabled, onToggleNotifications, isAdmin, fotos = {}, onPhoto, onAttendance, onVisitor, onMember }) {
+  function avatarPessoa(person) {
+    const foto = fotos[person.id];
+    if (foto) {
+      return isAdmin && onPhoto
+        ? <button type="button" className="avatar avatar-button" onClick={() => onPhoto(person.id)} title="Alterar foto" aria-label={`Alterar foto de ${person.name}`}><img className="avatar-photo" src={foto} alt="" /></button>
+        : <img className="avatar avatar-photo" src={foto} alt="" />;
+    }
+    if (isAdmin && onPhoto) {
+      return <button type="button" className="avatar avatar-button" onClick={() => onPhoto(person.id)} title="Adicionar foto" aria-label={`Adicionar foto a ${person.name}`}><Camera size={14} /></button>;
+    }
+    return <span className="avatar">{person.initials || initialsOf(person.name)}</span>;
+  }
   if (active === 'Turmas') return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Organização</span><h1>Turmas</h1><p>{classes.length ? plural(classes.length, 'turma disponível', 'turmas disponíveis') : 'Sem dados recebidos'}</p></div><button className="outline-button export-button" onClick={() => onExport('Turmas')} disabled={!classes.length}><Download size={16} /> Exportar CSV</button></div>{classes.length ? <div className="workspace-list">{classes.map((item, index) => <article className="workspace-row" key={item.id}><div className={`class-badge ${item.color || ['coral', 'sky', 'gold', 'mint'][index % 4]}`}><BookOpen size={17} /></div><div className="workspace-row-copy"><strong>{item.name}</strong><small>{item.age_min != null && item.age_max != null ? `${item.age_min}–${item.age_max} anos` : 'Faixa etária não indicada'} · {item.professor_name || item.equipa?.Professor?.[0]?.nome || 'Equipa por consultar'}</small></div><span>{item.alunos ?? item.students ?? 0} alunos</span></article>)}</div> : <EmptyState icon={BookOpen} title="Ainda não há turmas para mostrar" hint="As turmas aparecerão aqui quando estiverem disponíveis." />}</section>;
 
-  if (active === 'Pessoas') return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Comunidade</span><h1>Pessoas</h1><p>{members.length || visitors.length ? `${plural(members.length, 'pessoa registada', 'pessoas registadas')} e ${plural(visitors.length, 'visitante', 'visitantes')}` : 'Ainda não há pessoas para mostrar'}</p></div><div className="workspace-actions"><button className="outline-button export-button" onClick={() => onExport('Pessoas')} disabled={!members.length}><Download size={16} /> Exportar</button><button className="primary-button" onClick={onAddVisitor}><Plus size={16} /> Visitante</button></div></div>{members.length ? <div className="panel workspace-table"><div className="workspace-table-head"><span>Nome</span><span>Turma</span><span>Estado</span></div>{members.map((person) => <div className="workspace-table-row" key={person.id}><strong>{person.name}</strong><span>{getClassName(person.class_id)}</span><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Ainda não há pessoas para mostrar" hint="Se esperava ver nomes, atualize os dados. Se continuar, peça ajuda ao responsável." />}<h2 className="workspace-subheading">Visitantes</h2>{visitors.length ? <div className="panel workspace-table">{visitors.map((visitor) => <div className="workspace-table-row visitor-table-row" key={visitor.id}><strong>{visitor.name}</strong><span>{visitor.className || 'Visitante'}</span><span>{visitor.date || 'Data indisponível'}</span></div>)}</div> : <EmptyState icon={Sparkles} title="Ainda não há visitantes para mostrar" hint="Os visitantes aparecerão aqui quando forem registados." />}</section>;
+  if (active === 'Pessoas') return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Comunidade</span><h1>Pessoas</h1><p>{members.length || visitors.length ? `${plural(members.length, 'pessoa registada', 'pessoas registadas')} e ${plural(visitors.length, 'visitante', 'visitantes')}` : 'Ainda não há pessoas para mostrar'}</p></div><div className="workspace-actions"><button className="outline-button export-button" onClick={() => onExport('Pessoas')} disabled={!members.length}><Download size={16} /> Exportar</button>{isAdmin && <button className="outline-button" onClick={onVisitor}><Plus size={16} /> Visitante</button>}{isAdmin && <button className="primary-button" onClick={onMember}><Plus size={16} /> Aluno</button>}</div></div>{members.length ? <div className="panel workspace-table"><div className="workspace-table-head"><span>Nome</span><span>Turma</span><span>Estado</span></div>{members.map((person) => <div className="workspace-table-row" key={person.id}><strong>{avatarPessoa(person)}{person.name}</strong><span>{getClassName(person.class_id)}</span><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Ainda não há pessoas para mostrar" hint="Se esperava ver nomes, atualize os dados. Se continuar, peça ajuda ao responsável." />}<h2 className="workspace-subheading">Visitantes</h2>{visitors.length ? <div className="panel workspace-table">{visitors.map((visitor) => <div className="workspace-table-row visitor-table-row" key={visitor.id}><strong>{visitor.name}</strong><span>{visitor.className || 'Visitante'}</span><span>{visitor.date || 'Data indisponível'}</span></div>)}</div> : <EmptyState icon={Sparkles} title="Ainda não há visitantes para mostrar" hint="Os visitantes aparecerão aqui quando forem registados." />}</section>;
 
   if (active === 'Presenças') {
     const records = attendanceRecords.slice().sort((a, b) => {
@@ -573,7 +659,7 @@ function WorkspacePage({ active, classes, members, visitors, sessions, attendanc
       const db = b.sessionDate || b.createdAt?.toDate?.()?.toISOString?.() || '';
       return db.localeCompare(da);
     });
-    return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Acompanhamento</span><h1>Presenças</h1><p>Registos de presença por data de sessão</p></div><button className="primary-button" onClick={onAttendance} disabled={!members.length}><Plus size={16} /> Registar presença</button></div>
+    return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Acompanhamento</span><h1>Presenças</h1><p>Registos de presença por data de sessão</p></div>{isAdmin && <button className="primary-button" onClick={onAttendance} disabled={!members.length}><Plus size={16} /> Registar presença</button>}</div>
       {records.length ? records.map((rec) => {
         const sessDate = rec.sessionDate || (rec.createdAt?.toDate?.() ? rec.createdAt.toDate().toISOString().slice(0,10) : '');
         const turmas = classes.filter((c) => String(c.id) === String(rec.classId));
@@ -584,7 +670,7 @@ function WorkspacePage({ active, classes, members, visitors, sessions, attendanc
         });
         return <section className="panel attendance-class" key={rec.id} style={{ marginBottom: 16 }}>
           <div className="panel-heading"><div><span className="section-kicker">Sessão</span><h2>{turmaNome} · {formatDatePt(sessDate) || 'Data não indicada'}</h2></div><span className="attendance-count">{items.filter((i) => i.status === 'Presente').length}/{items.length} presentes</span></div>
-          {items.map((i) => <div className="attendance-person" key={i.memberId}><div className="avatar">{initialsOf(i.name)}</div><strong>{i.name}</strong><span className={`presence ${i.status === 'Ausente' ? 'absent' : 'present'}`}><i />{i.status}</span></div>)}
+          {items.map((i) => <div className="attendance-person" key={i.memberId}>{fotos[i.memberId] ? <img className="avatar avatar-photo" src={fotos[i.memberId]} alt="" /> : <div className="avatar">{initialsOf(i.name)}</div>}<strong>{i.name}</strong><span className={`presence ${i.status === 'Ausente' ? 'absent' : 'present'}`}><i />{i.status}</span></div>)}
         </section>;
       }) : <EmptyState icon={BookOpen} title="Sem registos de presença" hint="Registe presenças para cada domingo/turma. Os registos aparecem aqui agrupados por data." />}
     </section>;
@@ -595,38 +681,90 @@ function WorkspacePage({ active, classes, members, visitors, sessions, attendanc
   return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Aplicação</span><h1>Definições</h1><p>Preferências e estado dos dados</p></div></div><div className="panel settings-list"><div className="setting-row"><span><strong>Dados da comunidade</strong><small>A informação é atualizada quando entra no painel.</small></span><span className={`setting-status ${sync.status === 'live' ? '' : 'setting-status-warn'}`}>{sync.status === 'live' ? 'Ligação ativa' : sync.status === 'loading' ? 'A carregar' : 'Indisponível'}</span></div><div className="setting-row"><span><strong>Última atualização</strong><small>{sync.savedAt ? relativeTime(sync.savedAt) : 'Ainda não foi atualizada'}</small></span><button className="outline-button export-button" onClick={onSync} disabled={sync.status === 'loading'}><RefreshCw size={16} /> Atualizar</button></div><div className="setting-row"><span><strong>Exportação</strong><small>Descarregar listas de turmas e pessoas</small></span><button className="outline-button export-button" onClick={() => onExport('Turmas')} disabled={!classes.length}><Download size={16} /> Exportar turmas</button></div><div className="setting-row"><span><strong>Notificações</strong><small>Mostrar o indicador de notificações na barra superior</small></span><input type="checkbox" checked={notificationsEnabled} onChange={onToggleNotifications} /></div><div className="setting-row"><span><strong>Conta</strong><small>A autenticação está ativa.</small></span><span className="setting-status">{sync.status === 'live' ? 'Acesso confirmado' : 'Sessão iniciada'}</span></div></div></section>;
 }
 
-function ActionDialog({ type, classes, members, onClose, onSaveAttendance, onSaveVisitor, notificationsEnabled, onToggleNotifications, user, profile, onSignOut }) {
+function ActionDialog({ type, classes = [], members = [], onClose, onSaveAttendance, onSaveVisitor, onSaveMember, notificationsEnabled, onToggleNotifications, user, profile, onSignOut }) {
   const [selectedClass, setSelectedClass] = useState(classes[0]?.id ?? '');
   const [selectedMembers, setSelectedMembers] = useState([]);
-  const [sessionDate, setSessionDate] = useState(getNextSunday());
+  const [sessionDate, setSessionDate] = useState(hojeIso());
+  const [visitorName, setVisitorName] = useState('');
+  const [visitorDate, setVisitorDate] = useState(hojeIso());
+  const [memberName, setMemberName] = useState('');
+  const [memberBirth, setMemberBirth] = useState('');
+  const [enviando, setEnviando] = useState(false);
+  const [erro, setErro] = useState('');
   const classMembers = members.filter((person) => String(person.class_id) === String(selectedClass));
 
-  useEffect(() => {
-    setSelectedMembers([]);
-  }, [selectedClass, sessionDate]);
+  useEffect(() => { setSelectedMembers([]); }, [selectedClass]);
 
-  function submitAttendance(event) {
-    event.preventDefault();
-    onSaveAttendance(selectedClass, selectedMembers, sessionDate);
+  const titleMap = {
+    attendance: 'Registar presenças',
+    visitor: 'Adicionar visitante',
+    member: 'Novo aluno',
+    notifications: 'Notificações',
+    profile: 'Perfil',
+  };
+
+  async function enviar(acao) {
+    setEnviando(true);
+    setErro('');
+    try {
+      await acao();
+    } catch (error) {
+      setErro(error.message || 'Não foi possível guardar. Tente novamente.');
+    } finally {
+      setEnviando(false);
+    }
   }
 
-  function submitVisitor(event) {
+  function submeterPresencas(event) {
     event.preventDefault();
-    const formData = new FormData(event.currentTarget);
-    onSaveVisitor({ name: String(formData.get('name') || '').trim(), className: String(formData.get('className') || 'Visitante') });
+    enviar(() => onSaveAttendance({
+      classId: selectedClass,
+      date: sessionDate,
+      attendance: classMembers.map((person) => ({
+        memberId: person.id,
+        status: selectedMembers.includes(person.id) ? 'Presente' : 'Ausente',
+      })),
+    }));
   }
 
-  const titleMap = { attendance: 'Registar presenças', visitor: 'Adicionar visitante', notifications: 'Notificações', profile: 'Perfil' };
+  function submeterVisitante(event) {
+    event.preventDefault();
+    enviar(() => onSaveVisitor({ name: visitorName.trim(), classId: selectedClass, date: visitorDate }));
+  }
 
-  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="action-dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><div className="dialog-heading"><h2 id="dialog-title">{titleMap[type] ?? 'Diálogo'}</h2><button className="icon-button" onClick={onClose} aria-label="Fechar"><X size={18} /></button></div>
-    {type === 'attendance' && <form onSubmit={submitAttendance}>
+  function submeterAluno(event) {
+    event.preventDefault();
+    enviar(() => onSaveMember({ name: memberName.trim(), birth_date: memberBirth }));
+  }
+
+  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !enviando) onClose(); }}><section className="action-dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><div className="dialog-heading"><h2 id="dialog-title">{titleMap[type] ?? 'Diálogo'}</h2><button className="icon-button" onClick={onClose} aria-label="Fechar" disabled={enviando}><X size={18} /></button></div>
+
+    {type === 'attendance' && <form onSubmit={submeterPresencas}>
       <label className="form-field">Turma<select value={selectedClass} onChange={(event) => setSelectedClass(event.target.value)}>{classes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
-      <label className="form-field">Data da sessão<input type="date" value={sessionDate} onChange={(event) => setSessionDate(event.target.value)} /></label>
+      <label className="form-field">Data da sessão<input type="date" value={sessionDate} onChange={(event) => setSessionDate(event.target.value)} required /></label>
       {classMembers.length ? <div className="attendance-checklist">{classMembers.map((person) => <label className="check-row" key={person.id}><input type="checkbox" checked={selectedMembers.includes(person.id)} onChange={(event) => setSelectedMembers((current) => event.target.checked ? [...current, person.id] : current.filter((id) => id !== person.id))} /><span>{person.name}</span></label>)}</div> : <p className="dialog-note">Esta turma ainda não tem pessoas registadas.</p>}
-      <p className="dialog-note">As presenças serão guardadas e ficarão disponíveis no painel.</p>
-      <button className="primary-button dialog-submit" type="submit"><Check size={16} /> Guardar presenças</button>
+      <p className="dialog-note">Assinale quem está presente. Os restantes ficam como ausentes nesta data.</p>
+      {erro && <p className="dialog-erro" role="alert">{erro}</p>}
+      <button className="primary-button dialog-submit" type="submit" disabled={enviando || !classMembers.length}>{enviando ? 'A guardar...' : <><Check size={16} /> Guardar presenças</>}</button>
     </form>}
-    {type === 'visitor' && <form onSubmit={submitVisitor}><label className="form-field">Nome<input name="name" required autoFocus placeholder="Nome completo" /></label><label className="form-field">Turma de acolhimento<select name="className"><option value="Visitante">Sem turma</option>{classes.map((item) => <option key={item.id} value={item.name}>{item.name}</option>)}</select></label><p className="dialog-note">O visitante será guardado e ficará disponível no painel.</p><button className="primary-button dialog-submit" type="submit"><Plus size={16} /> Guardar visitante</button></form>}
+
+    {type === 'visitor' && <form onSubmit={submeterVisitante}>
+      <label className="form-field">Nome completo<input value={visitorName} onChange={(event) => setVisitorName(event.target.value)} required minLength={2} autoFocus placeholder="Nome do visitante" /></label>
+      <label className="form-field">Turma de acolhimento<select value={selectedClass} onChange={(event) => setSelectedClass(event.target.value)}>{classes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
+      <label className="form-field">Data da sessão<input type="date" value={visitorDate} onChange={(event) => setVisitorDate(event.target.value)} required /></label>
+      <p className="dialog-note">O visitante fica associado à turma escolhida nesta data.</p>
+      {erro && <p className="dialog-erro" role="alert">{erro}</p>}
+      <button className="primary-button dialog-submit" type="submit" disabled={enviando || !classes.length}>{enviando ? 'A guardar...' : <><Plus size={16} /> Guardar visitante</>}</button>
+    </form>}
+
+    {type === 'member' && <form onSubmit={submeterAluno}>
+      <label className="form-field">Nome completo<input value={memberName} onChange={(event) => setMemberName(event.target.value)} required minLength={2} autoFocus placeholder="Nome do aluno" /></label>
+      <label className="form-field">Data de nascimento<input type="date" value={memberBirth} onChange={(event) => setMemberBirth(event.target.value)} required /></label>
+      <p className="dialog-note">A turma é calculada automaticamente pela idade. A foto pode ser acrescentada na lista de Pessoas.</p>
+      {erro && <p className="dialog-erro" role="alert">{erro}</p>}
+      <button className="primary-button dialog-submit" type="submit" disabled={enviando}>{enviando ? 'A guardar...' : <><Plus size={16} /> Guardar aluno</>}</button>
+    </form>}
+
     {type === 'notifications' && <div className="dialog-copy"><p>O indicador de notificações está {notificationsEnabled ? 'ativo' : 'inativo'} nas definições locais.</p><button className="outline-button" onClick={onToggleNotifications}>{notificationsEnabled ? 'Desativar' : 'Ativar'} notificações</button></div>}
     {type === 'profile' && <div className="dialog-copy"><div className="profile-dialog-avatar"><UserRound size={22} /></div><strong>{profile?.displayName || user?.displayName || user?.email}</strong><p>{profile?.status === 'admin' ? 'Administrador com acesso de gestão.' : 'Utilizador com acesso apenas de leitura.'}</p><button className="outline-button" onClick={onSignOut}>Terminar sessão</button></div>}
   </section></div>;

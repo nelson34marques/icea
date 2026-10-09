@@ -1,4 +1,4 @@
-const CACHE_NAME = 'icea-v3';
+const CACHE_NAME = 'icea-v5';
 const APP_SHELL = [
   '/',
   '/index.html',

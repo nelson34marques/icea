@@ -10,7 +10,6 @@ import {
   signOut,
 } from '@firebase/auth';
 import {
-  addDoc,
   collection,
   doc,
   getDoc,
@@ -18,7 +17,6 @@ import {
   onSnapshot,
   orderBy,
   query,
-  serverTimestamp,
   setDoc,
 } from '@firebase/firestore';
 
@@ -116,32 +114,6 @@ export function subscribeToAttendanceRecords(callback, onError) {
   return onSnapshot(recordsQuery, (snapshot) => {
     callback(snapshot.docs.map((record) => ({ id: record.id, ...record.data() })));
   }, onError);
-}
-
-export function addVisitorRecord(visitor, user) {
-  return addDoc(collection(db, 'visitors'), {
-    name: visitor.name,
-    className: visitor.className,
-    createdAt: serverTimestamp(),
-    createdBy: user.uid,
-  });
-}
-
-export function addAttendanceRecord(classId, members, selectedIds, user, sessionDate) {
-  const attendance = members
-    .filter((person) => String(person.class_id) === String(classId))
-    .map((person) => ({
-      memberId: person.id,
-      status: selectedIds.includes(person.id) ? 'Presente' : 'Ausente',
-    }));
-
-  return addDoc(collection(db, 'attendance'), {
-    classId: String(classId),
-    attendance,
-    sessionDate: sessionDate || null,
-    createdAt: serverTimestamp(),
-    createdBy: user.uid,
-  });
 }
 
 export function signOutUser() {
