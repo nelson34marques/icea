@@ -220,6 +220,41 @@ function hojeIso() {
   return `${agora.getFullYear()}-${String(agora.getMonth() + 1).padStart(2, '0')}-${String(agora.getDate()).padStart(2, '0')}`;
 }
 
+function birthdayReminder(member, today = new Date()) {
+  const rawBirthDate = member.birth_date || member.birthDate || member.data_nascimento || member.dataNascimento;
+  const raw = String(rawBirthDate || '').trim();
+  const iso = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  const br = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  const year = Number(iso?.[1] || br?.[3]);
+  const month = Number(iso?.[2] || br?.[2]);
+  const day = Number(iso?.[3] || br?.[1]);
+  if (!year || !month || !day) return null;
+  const recordedBirthDate = new Date(Date.UTC(year, month - 1, day));
+  if (recordedBirthDate.getUTCFullYear() !== year || recordedBirthDate.getUTCMonth() !== month - 1 || recordedBirthDate.getUTCDate() !== day) return null;
+
+  const todayUtc = Date.UTC(today.getFullYear(), today.getMonth(), today.getDate());
+  let birthdayYear = today.getFullYear();
+  let birthdayDay;
+  let birthdayUtc;
+
+  do {
+    const lastDayOfMonth = new Date(birthdayYear, month, 0).getDate();
+    birthdayDay = Math.min(day, lastDayOfMonth);
+    birthdayUtc = Date.UTC(birthdayYear, month - 1, birthdayDay);
+    if (birthdayUtc < todayUtc) birthdayYear += 1;
+  } while (birthdayUtc < todayUtc);
+
+  const daysUntil = Math.round((birthdayUtc - todayUtc) / 86400000);
+  if (daysUntil !== 7 && daysUntil !== 3) return null;
+
+  return {
+    id: member.id,
+    name: member.name || member.nome || 'Aluno',
+    date: `${String(birthdayDay).padStart(2, '0')}/${String(month).padStart(2, '0')}`,
+    daysUntil,
+  };
+}
+
 const SYNC_COPY = {
   loading: { title: 'A carregar dados', hint: 'Pode demorar alguns instantes.', dot: 'status-loading' },
   live: { title: 'Dados atualizados', hint: 'Informação atualizada.', dot: '' },
@@ -378,6 +413,11 @@ function App() {
     [dashboard.attendanceRecords, legacyAttendanceRecords],
   );
   const visibleMembers = members.map((person) => ({ ...person, status: attendanceStatus[person.id] || person.status }));
+  const todayKey = hojeIso();
+  const birthdayNotifications = useMemo(
+    () => members.map((member) => birthdayReminder(member, new Date(`${todayKey}T00:00:00`))).filter(Boolean).sort((a, b) => a.daysUntil - b.daysUntil),
+    [members, todayKey],
+  );
   const isBootLoading = sync.status === 'loading' && !classes.length && !members.length && !sessions.length && !visitors.length;
   const hasNoData = !classes.length && !members.length && !sessions.length && !visitors.length;
 
@@ -606,7 +646,7 @@ function App() {
           </> : hasNoData ? <EmptyState icon={Inbox} title="Ainda não há dados para mostrar" hint="Atualize os dados. Se continuar sem informação, peça ajuda ao responsável." /> : <WorkspacePage active={active} classes={classes} members={visibleMembers} visitors={visitors} sessions={sessions} attendanceRecords={attendanceRecords} getClassName={getClassName} onExport={exportCsv} sync={sync} onSync={() => syncDashboard()} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} isAdmin={isAdmin} fotos={fotos} onPhoto={escolherFoto} onAttendance={() => setModal('attendance')} onVisitor={() => setModal('visitor')} onMember={() => setModal('member')} />}
         </div>
       </main>
-      {modal && <ActionDialog type={modal} classes={classes} members={visibleMembers} onClose={() => setModal('')} onSaveAttendance={guardarPresencas} onSaveVisitor={guardarVisitante} onSaveMember={guardarAluno} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} user={authSession.user} profile={authSession.profile} onSignOut={signOutUser} />}
+      {modal && <ActionDialog type={modal} classes={classes} members={visibleMembers} birthdayNotifications={birthdayNotifications} onClose={() => setModal('')} onSaveAttendance={guardarPresencas} onSaveVisitor={guardarVisitante} onSaveMember={guardarAluno} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} user={authSession.user} profile={authSession.profile} onSignOut={signOutUser} />}
 
       <input id="input-foto" type="file" accept="image/*" className="input-foto-oculto" onChange={aoEscolherFoto} aria-label="Escolher foto do aluno" />
 
@@ -681,7 +721,7 @@ function WorkspacePage({ active, classes, members, visitors, sessions, attendanc
   return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Aplicação</span><h1>Definições</h1><p>Preferências e estado dos dados</p></div></div><div className="panel settings-list"><div className="setting-row"><span><strong>Dados da comunidade</strong><small>A informação é atualizada quando entra no painel.</small></span><span className={`setting-status ${sync.status === 'live' ? '' : 'setting-status-warn'}`}>{sync.status === 'live' ? 'Ligação ativa' : sync.status === 'loading' ? 'A carregar' : 'Indisponível'}</span></div><div className="setting-row"><span><strong>Última atualização</strong><small>{sync.savedAt ? relativeTime(sync.savedAt) : 'Ainda não foi atualizada'}</small></span><button className="outline-button export-button" onClick={onSync} disabled={sync.status === 'loading'}><RefreshCw size={16} /> Atualizar</button></div><div className="setting-row"><span><strong>Exportação</strong><small>Descarregar listas de turmas e pessoas</small></span><button className="outline-button export-button" onClick={() => onExport('Turmas')} disabled={!classes.length}><Download size={16} /> Exportar turmas</button></div><div className="setting-row"><span><strong>Notificações</strong><small>Mostrar o indicador de notificações na barra superior</small></span><input type="checkbox" checked={notificationsEnabled} onChange={onToggleNotifications} /></div><div className="setting-row"><span><strong>Conta</strong><small>A autenticação está ativa.</small></span><span className="setting-status">{sync.status === 'live' ? 'Acesso confirmado' : 'Sessão iniciada'}</span></div></div></section>;
 }
 
-function ActionDialog({ type, classes = [], members = [], onClose, onSaveAttendance, onSaveVisitor, onSaveMember, notificationsEnabled, onToggleNotifications, user, profile, onSignOut }) {
+function ActionDialog({ type, classes = [], members = [], birthdayNotifications = [], onClose, onSaveAttendance, onSaveVisitor, onSaveMember, notificationsEnabled, onToggleNotifications, user, profile, onSignOut }) {
   const [selectedClass, setSelectedClass] = useState(classes[0]?.id ?? '');
   const [selectedMembers, setSelectedMembers] = useState([]);
   const [sessionDate, setSessionDate] = useState(hojeIso());
@@ -765,7 +805,17 @@ function ActionDialog({ type, classes = [], members = [], onClose, onSaveAttenda
       <button className="primary-button dialog-submit" type="submit" disabled={enviando}>{enviando ? 'A guardar...' : <><Plus size={16} /> Guardar aluno</>}</button>
     </form>}
 
-    {type === 'notifications' && <div className="dialog-copy"><p>O indicador de notificações está {notificationsEnabled ? 'ativo' : 'inativo'} nas definições locais.</p><button className="outline-button" onClick={onToggleNotifications}>{notificationsEnabled ? 'Desativar' : 'Ativar'} notificações</button></div>}
+    {type === 'notifications' && <div className="birthday-notifications">
+      <h3>Aniversários próximos</h3>
+      {birthdayNotifications.length ? birthdayNotifications.map((notification) => (
+        <div className="birthday-notification" key={`${notification.id}-${notification.daysUntil}`}>
+          <Bell size={16} />
+          <p><strong>{notification.name}</strong> completa anos no dia <strong>{notification.date}</strong> (daqui a {notification.daysUntil} dias).</p>
+        </div>
+      )) : <p className="dialog-note">Não há aniversários a completar daqui a 7 ou 3 dias.</p>}
+      <p className="dialog-note">O indicador de notificações está {notificationsEnabled ? 'ativo' : 'inativo'} nas definições locais.</p>
+      <button className="outline-button" onClick={onToggleNotifications}>{notificationsEnabled ? 'Desativar' : 'Ativar'} indicador</button>
+    </div>}
     {type === 'profile' && <div className="dialog-copy"><div className="profile-dialog-avatar"><UserRound size={22} /></div><strong>{profile?.displayName || user?.displayName || user?.email}</strong><p>{profile?.status === 'admin' ? 'Administrador com acesso de gestão.' : 'Utilizador com acesso apenas de leitura.'}</p><button className="outline-button" onClick={onSignOut}>Terminar sessão</button></div>}
   </section></div>;
 }
