@@ -3,6 +3,7 @@ import {
   BarChart3,
   Bell,
   BookOpen,
+  Cake,
   CalendarDays,
   Camera,
   Check,
@@ -24,6 +25,7 @@ import {
   Sparkles,
   Sun,
   Trash2,
+  UserPlus,
   UserRound,
   UsersRound,
   WifiOff,
@@ -75,6 +77,21 @@ function dateKey(value) {
   const br = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (br) return `${br[3]}-${String(br[2]).padStart(2, '0')}-${String(br[1]).padStart(2, '0')}`;
   return raw;
+}
+
+function dateOnly(value) {
+  const key = dateKey(value);
+  const match = key.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function daysFromToday(value, today) {
+  const date = dateOnly(value);
+  if (!date) return null;
+  const base = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  return Math.round((date - base) / 86400000);
 }
 
 function mergeAttendance(apiRecords = [], legacyRecords = []) {
@@ -234,6 +251,18 @@ function formatDatePt(iso) {
   return `${d}/${m}/${y}`;
 }
 
+function formatDateShort(value) {
+  const date = dateOnly(value);
+  if (!date) return String(value || '—');
+  return new Intl.DateTimeFormat('pt-PT', { day: '2-digit', month: '2-digit' }).format(date);
+}
+
+function relativeDayLabel(days) {
+  if (days === 0) return 'Hoje';
+  if (days === 1) return 'Amanhã';
+  return `Em ${days} dias`;
+}
+
 function hojeIso() {
   const agora = new Date();
   return `${agora.getFullYear()}-${String(agora.getMonth() + 1).padStart(2, '0')}-${String(agora.getDate()).padStart(2, '0')}`;
@@ -264,13 +293,16 @@ function birthdayReminder(member, today = new Date()) {
   } while (birthdayUtc < todayUtc);
 
   const daysUntil = Math.round((birthdayUtc - todayUtc) / 86400000);
-  if (daysUntil !== 7 && daysUntil !== 3) return null;
+  if (daysUntil > 30) return null;
+
+  const turningAge = birthdayYear - year;
 
   return {
     id: member.id,
     name: member.name || member.nome || 'Aluno',
     date: `${String(birthdayDay).padStart(2, '0')}/${String(month).padStart(2, '0')}`,
     daysUntil,
+    turningAge: turningAge > 0 ? turningAge : null,
   };
 }
 
@@ -298,6 +330,14 @@ function App() {
   const [legacyVisitorRecords, setLegacyVisitorRecords] = useState([]);
   const [legacyAttendanceRecords, setLegacyAttendanceRecords] = useState([]);
   const [attendanceStatus, setAttendanceStatus] = useState({});
+  const [activityLog, setActivityLog] = useState(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem('icea-activity-log') || '[]');
+      return Array.isArray(stored) ? stored : [];
+    } catch {
+      return [];
+    }
+  });
   const [period, setPeriod] = useState('Este mês');
   const [notice, setNotice] = useState('');
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => localStorage.getItem('icea-notifications') !== 'false');
@@ -335,8 +375,10 @@ function App() {
       if (!user) {
         try {
           localStorage.removeItem(CACHE_KEY);
+          localStorage.removeItem('icea-activity-log');
         } catch {}
         setDashboard(EMPTY_DASHBOARD);
+        setActivityLog([]);
         setFotos({});
         setFotosCarregadas(false);
         setLegacyVisitorRecords([]);
@@ -436,12 +478,13 @@ function App() {
   }, [authSession.user, authSession.loading, syncDashboard]);
 
   const classes = dashboard.classes ?? [];
-  const members = dashboard.members ?? [];
+  const members = useMemo(() => dashboard.members ?? [], [dashboard.members]);
   const sessions = dashboard.sessions ?? [];
   const stats = dashboard.stats ?? {};
+  const apiVisitors = useMemo(() => dashboard.visitors ?? [], [dashboard.visitors]);
   const visitors = useMemo(
-    () => mergeVisitors(dashboard.visitors ?? [], legacyVisitorRecords),
-    [dashboard.visitors, legacyVisitorRecords],
+    () => mergeVisitors(apiVisitors, legacyVisitorRecords),
+    [apiVisitors, legacyVisitorRecords],
   );
   const attendanceRecords = useMemo(
     () => mergeAttendance(dashboard.attendanceRecords ?? [], legacyAttendanceRecords),
@@ -449,10 +492,60 @@ function App() {
   );
   const visibleMembers = members.map((person) => ({ ...person, status: attendanceStatus[person.id] || person.status }));
   const todayKey = hojeIso();
-  const birthdayNotifications = useMemo(
-    () => members.map((member) => birthdayReminder(member, new Date(`${todayKey}T00:00:00`))).filter(Boolean).sort((a, b) => a.daysUntil - b.daysUntil),
-    [members, todayKey],
-  );
+  const notifications = useMemo(() => {
+    const today = new Date(`${todayKey}T00:00:00`);
+    const birthdays = members
+      .map((member) => birthdayReminder(member, today))
+      .filter(Boolean)
+      .sort((a, b) => a.daysUntil - b.daysUntil);
+
+    const now = Date.now();
+    const activity = activityLog
+      .filter((entry) => entry && entry.at && now - entry.at <= 30 * 86400000)
+      .sort((a, b) => b.at - a.at)
+      .slice(0, 10);
+
+    const visitorWhen = (visitor) => {
+      const created = visitor.createdAt ?? visitor.created_at;
+      return (typeof created === 'string' || typeof created === 'number') ? created : visitor.date;
+    };
+    const recentVisitors = visitors
+      .map((visitor) => ({ ...visitor, daysUntil: daysFromToday(visitorWhen(visitor), today) }))
+      .sort((a, b) => dateKey(visitorWhen(b)).localeCompare(dateKey(visitorWhen(a))))
+      .slice(0, 5);
+
+    const upcomingSessions = sessions
+      .map((session) => {
+        const value = session.date || session.data || session.start;
+        return { ...session, sessionValue: value, daysUntil: daysFromToday(value, today) };
+      })
+      .filter((session) => session.daysUntil != null && session.daysUntil >= 0 && session.daysUntil <= 30)
+      .sort((a, b) => a.daysUntil - b.daysUntil)
+      .slice(0, 5);
+
+    const pendingAttendance = sessions
+      .map((session) => {
+        const value = session.date || session.data || session.start;
+        const daysUntil = daysFromToday(value, today);
+        const matriculados = Number(session.matriculados ?? session.students ?? 0);
+        const presencas = Number(session.presencas ?? session.present ?? 0);
+        if (daysUntil == null || daysUntil >= 0 || daysUntil < -30) return null;
+        if (!(matriculados > 0) || presencas > 0) return null;
+        return { ...session, sessionValue: value, daysUntil, matriculados, presencas };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.daysUntil - a.daysUntil)
+      .slice(0, 5);
+
+    const missingBirthdays = members.filter((member) => !['birth_date', 'birthDate', 'data_nascimento', 'dataNascimento'].some((field) => member[field]));
+
+    return { birthdays, activity, recentVisitors, upcomingSessions, pendingAttendance, missingBirthdays };
+  }, [members, visitors, sessions, activityLog, todayKey]);
+
+  const notificationCount = notifications.birthdays.filter((item) => item.daysUntil <= 7).length
+    + notifications.activity.length
+    + notifications.upcomingSessions.filter((item) => item.daysUntil <= 7).length
+    + notifications.pendingAttendance.length;
   const isBootLoading = sync.status === 'loading' && !classes.length && !members.length && !sessions.length && !visitors.length;
   const hasNoData = !classes.length && !members.length && !sessions.length && !visitors.length;
 
@@ -473,6 +566,53 @@ function App() {
     }
     setAttendanceStatus(nextStatuses);
   }, [attendanceRecords]);
+
+  useEffect(() => {
+    if (!members.length && !apiVisitors.length) return;
+    const readKnown = (key) => {
+      try {
+        const value = JSON.parse(localStorage.getItem(key) || 'null');
+        return Array.isArray(value) ? value : null;
+      } catch {
+        return null;
+      }
+    };
+    const knownMembers = readKnown('icea-known-members');
+    const knownVisitors = readKnown('icea-known-visitors');
+    const now = Date.now();
+    const entries = [];
+    if (knownMembers) {
+      const known = new Set(knownMembers.map(String));
+      members.forEach((member) => {
+        if (member?.id != null && !known.has(String(member.id))) {
+          entries.push({ key: `aluno-${member.id}`, kind: 'aluno', name: member.name || member.nome || 'Aluno', at: now });
+        }
+      });
+    }
+    if (knownVisitors) {
+      const known = new Set(knownVisitors.map(String));
+      apiVisitors.forEach((visitor) => {
+        if (visitor?.id != null && !known.has(String(visitor.id))) {
+          entries.push({ key: `visitante-${visitor.id}`, kind: 'visitante', name: visitor.name || 'Visitante', at: now });
+        }
+      });
+    }
+    try {
+      if (members.length) localStorage.setItem('icea-known-members', JSON.stringify(members.map((member) => String(member.id))));
+      if (apiVisitors.length) localStorage.setItem('icea-known-visitors', JSON.stringify(apiVisitors.map((visitor) => String(visitor.id))));
+    } catch {}
+    if (!entries.length) return;
+    setActivityLog((previous) => {
+      const merged = new Map(previous.map((entry) => [entry.key, entry]));
+      entries.forEach((entry) => merged.set(entry.key, entry));
+      const limite = now - 30 * 86400000;
+      const next = [...merged.values()].filter((entry) => entry.at >= limite).sort((a, b) => b.at - a.at).slice(0, 30);
+      try {
+        localStorage.setItem('icea-activity-log', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  }, [members, apiVisitors]);
 
   const searchTerm = searchQuery.trim().toLocaleLowerCase('pt-PT');
   const searchResults = useMemo(() => {
@@ -665,7 +805,7 @@ function App() {
             {searchOpen && <div className="search-wrap search-visible"><Search size={18} /><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Pesquisar..." aria-label="Pesquisar" /></div>}
             <button className="icon-button search-trigger" onClick={() => setSearchOpen((open) => !open)} aria-label={searchOpen ? 'Fechar pesquisa' : 'Pesquisar'} title={searchOpen ? 'Fechar pesquisa' : 'Pesquisar'}>{searchOpen ? <X size={19} /> : <Search size={19} />}</button>
             <button className="icon-button theme-toggle" onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')} aria-label={theme === 'dark' ? 'Ativar modo claro' : 'Ativar modo escuro'} title={theme === 'dark' ? 'Modo claro' : 'Modo escuro'}>{theme === 'dark' ? <Sun size={19} /> : <Moon size={19} />}</button>
-            {isAdmin && <button className="icon-button notification-button" onClick={() => setModal('notifications')} aria-label="Notificações"><Bell size={19} />{notificationsEnabled && <span />}</button>}
+            {isAdmin && <button className="icon-button notification-button" onClick={() => setModal('notifications')} aria-label={`Notificações${notificationCount ? ` (${notificationCount})` : ''}`}><Bell size={19} />{notificationsEnabled && notificationCount > 0 && <span>{notificationCount > 9 ? '9+' : notificationCount}</span>}</button>}
             <div className="top-avatar"><UserRound size={15} /></div>
           </div>
         </header>
@@ -718,7 +858,7 @@ function App() {
           </> : hasNoData ? <EmptyState icon={Inbox} title="Ainda não há dados para mostrar" hint="Atualize os dados. Se continuar sem informação, peça ajuda ao responsável." /> : <WorkspacePage active={active} classes={classes} members={visibleMembers} visitors={visitors} sessions={sessions} attendanceRecords={attendanceRecords} getClassName={getClassName} onExport={exportCsv} sync={sync} onSync={() => syncDashboard()} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} isAdmin={isAdmin} fotos={fotos} onPhoto={escolherFoto} onAttendance={() => setModal('attendance')} onVisitor={() => setModal('visitor')} onMember={() => setModal('member')} onDeleteVisitor={pedirEliminarVisitante} onDeleteMember={pedirEliminarAluno} />}
         </div>
       </main>
-      {modal && <ActionDialog type={modal} classes={classes} members={visibleMembers} birthdayNotifications={birthdayNotifications} onClose={() => setModal('')} onSaveAttendance={guardarPresencas} onSaveVisitor={guardarVisitante} onSaveMember={guardarAluno} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} user={authSession.user} profile={authSession.profile} onSignOut={signOutUser} />}
+      {modal && <ActionDialog type={modal} classes={classes} members={visibleMembers} notifications={notifications} onClose={() => setModal('')} onSaveAttendance={guardarPresencas} onSaveVisitor={guardarVisitante} onSaveMember={guardarAluno} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} user={authSession.user} profile={authSession.profile} onSignOut={signOutUser} />}
 
       {confirmarEliminacao && <ConfirmDialog
         title={confirmarEliminacao.tipo === 'aluno' ? 'Eliminar aluno' : 'Eliminar visitante'}
@@ -751,6 +891,17 @@ function EmptyState({ icon: Icon = Inbox, title, hint }) {
 
 function ConfirmDialog({ title, message, confirmLabel = 'Confirmar', onConfirm, onCancel }) {
   return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}><section className="action-dialog confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><div className="dialog-heading"><h2 id="confirm-title">{title}</h2><button className="icon-button" onClick={onCancel} aria-label="Fechar"><X size={18} /></button></div><p className="confirm-message">{message}</p><div className="confirm-actions"><button className="outline-button" onClick={onCancel}>Cancelar</button><button className="danger-button" onClick={onConfirm}><Trash2 size={16} /> {confirmLabel}</button></div></section></div>;
+}
+
+function NotificationGroup({ icon: Icon, tone = '', title, hint, count = 0, children }) {
+  return <section className={`notification-group ${tone}`}>
+    <header>
+      <span className="notification-group-icon"><Icon size={16} /></span>
+      <div><h3>{title}</h3>{hint && <small>{hint}</small>}</div>
+      {count > 0 && <span className="notification-count">{count}</span>}
+    </header>
+    <div className="notification-items">{children}</div>
+  </section>;
 }
 
 function DashboardSkeleton() {
@@ -805,7 +956,7 @@ function WorkspacePage({ active, classes, members, visitors, sessions, attendanc
   return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Aplicação</span><h1>Definições</h1><p>Preferências e estado dos dados</p></div></div><div className="panel settings-list"><div className="setting-row"><span><strong>Dados da comunidade</strong><small>A informação é atualizada quando entra no painel.</small></span><span className={`setting-status ${sync.status === 'live' ? '' : 'setting-status-warn'}`}>{sync.status === 'live' ? 'Ligação ativa' : sync.status === 'loading' ? 'A carregar' : 'Indisponível'}</span></div><div className="setting-row"><span><strong>Última atualização</strong><small>{sync.savedAt ? relativeTime(sync.savedAt) : 'Ainda não foi atualizada'}</small></span><button className="outline-button export-button" onClick={onSync} disabled={sync.status === 'loading'}><RefreshCw size={16} /> Atualizar</button></div><div className="setting-row"><span><strong>Exportação</strong><small>Descarregar listas de turmas e pessoas</small></span><button className="outline-button export-button" onClick={() => onExport('Turmas')} disabled={!classes.length}><Download size={16} /> Exportar turmas</button></div><div className="setting-row"><span><strong>Notificações</strong><small>Mostrar o indicador de notificações na barra superior</small></span><input type="checkbox" checked={notificationsEnabled} onChange={onToggleNotifications} /></div><div className="setting-row"><span><strong>Conta</strong><small>A autenticação está ativa.</small></span><span className="setting-status">{sync.status === 'live' ? 'Acesso confirmado' : 'Sessão iniciada'}</span></div></div></section>;
 }
 
-function ActionDialog({ type, classes = [], members = [], birthdayNotifications = [], onClose, onSaveAttendance, onSaveVisitor, onSaveMember, notificationsEnabled, onToggleNotifications, user, profile, onSignOut }) {
+function ActionDialog({ type, classes = [], members = [], notifications = {}, onClose, onSaveAttendance, onSaveVisitor, onSaveMember, notificationsEnabled, onToggleNotifications, user, profile, onSignOut }) {
   const [selectedClass, setSelectedClass] = useState(classes[0]?.id ?? '');
   const [selectedMembers, setSelectedMembers] = useState([]);
   const [sessionDate, setSessionDate] = useState(hojeIso());
@@ -816,6 +967,15 @@ function ActionDialog({ type, classes = [], members = [], birthdayNotifications 
   const [enviando, setEnviando] = useState(false);
   const [erro, setErro] = useState('');
   const classMembers = members.filter((person) => String(person.class_id) === String(selectedClass));
+  const classLabel = (value) => classes.find((item) => String(item.id) === String(value))?.name || value || 'Turma';
+  const notificationLists = {
+    birthdays: notifications.birthdays ?? [],
+    activity: notifications.activity ?? [],
+    recentVisitors: notifications.recentVisitors ?? [],
+    upcomingSessions: notifications.upcomingSessions ?? [],
+    pendingAttendance: notifications.pendingAttendance ?? [],
+    missingBirthdays: notifications.missingBirthdays ?? [],
+  };
 
   useEffect(() => { setSelectedMembers([]); }, [selectedClass]);
 
@@ -889,16 +1049,74 @@ function ActionDialog({ type, classes = [], members = [], birthdayNotifications 
       <button className="primary-button dialog-submit" type="submit" disabled={enviando}>{enviando ? 'A guardar...' : <><Plus size={16} /> Guardar aluno</>}</button>
     </form>}
 
-    {type === 'notifications' && <div className="birthday-notifications">
-      <h3>Aniversários próximos</h3>
-      {birthdayNotifications.length ? birthdayNotifications.map((notification) => (
-        <div className="birthday-notification" key={`${notification.id}-${notification.daysUntil}`}>
-          <Bell size={16} />
-          <p><strong>{notification.name}</strong> completa anos no dia <strong>{notification.date}</strong> (daqui a {notification.daysUntil} dias).</p>
-        </div>
-      )) : <p className="dialog-note">Não há aniversários a completar daqui a 7 ou 3 dias.</p>}
-      <p className="dialog-note">O indicador de notificações está {notificationsEnabled ? 'ativo' : 'inativo'} nas definições locais.</p>
-      <button className="outline-button" onClick={onToggleNotifications}>{notificationsEnabled ? 'Desativar' : 'Ativar'} indicador</button>
+    {type === 'notifications' && <div className="notifications-panel">
+      <p className="notifications-summary">Alertas da comunidade: aniversários, novos registos, eventos, visitantes e presenças por registar.</p>
+
+      <NotificationGroup icon={Cake} tone="cake" title="Aniversários" hint="Hoje, amanhã e próximos 30 dias" count={notificationLists.birthdays.length}>
+        {notificationLists.birthdays.length ? notificationLists.birthdays.map((item) => (
+          <div className="notification-item" key={`${item.id}-${item.daysUntil}`}>
+            <div className="notification-avatar">{initialsOf(item.name)}</div>
+            <div className="notification-copy">
+              <strong>{item.name}</strong>
+              <span>{item.turningAge ? `${item.turningAge} anos · ` : ''}{item.date} · {item.daysUntil === 0 ? 'é hoje' : item.daysUntil === 1 ? 'é amanhã' : `daqui a ${item.daysUntil} dias`}</span>
+            </div>
+            <span className={`notification-tag ${item.daysUntil <= 1 ? 'urgent' : ''}`}>{relativeDayLabel(item.daysUntil)}</span>
+          </div>
+        )) : <p className="notification-empty">Sem aniversários nos próximos 30 dias.</p>}
+      </NotificationGroup>
+
+      <NotificationGroup icon={UserPlus} title="Novas atualizações" hint="Alunos e visitantes desde a última visita" count={notificationLists.activity.length}>
+        {notificationLists.activity.length ? notificationLists.activity.map((item) => (
+          <div className="notification-item" key={item.key}>
+            <span className={`notification-dot ${item.kind}`} />
+            <div className="notification-copy"><strong>{item.kind === 'aluno' ? 'Novo aluno' : 'Novo visitante'}: {item.name}</strong><span>{relativeTime(item.at)}</span></div>
+          </div>
+        )) : <p className="notification-empty">Sem atualizações desde a última visita.</p>}
+      </NotificationGroup>
+
+      <NotificationGroup icon={CalendarDays} tone="events" title="Eventos e sessões" hint="Próximos 30 dias" count={notificationLists.upcomingSessions.length}>
+        {notificationLists.upcomingSessions.length ? notificationLists.upcomingSessions.map((session, index) => (
+          <div className="notification-item" key={session.id || `${session.class_id}-${session.sessionValue}-${index}`}>
+            <span className="notification-date">{formatDateShort(session.sessionValue)}</span>
+            <div className="notification-copy"><strong>{classLabel(session.class_id ?? session.classId ?? session.turma)}</strong><span>{relativeDayLabel(session.daysUntil)}{session.time || session.hora ? ` · ${session.time || session.hora}` : ''}</span></div>
+            <span className={`notification-tag ${session.daysUntil <= 1 ? 'urgent' : ''}`}>{relativeDayLabel(session.daysUntil)}</span>
+          </div>
+        )) : <p className="notification-empty">Sem sessões nos próximos 30 dias.</p>}
+      </NotificationGroup>
+
+      <NotificationGroup icon={Sparkles} title="Convidados recentes" hint="Últimos visitantes" count={notificationLists.recentVisitors.length}>
+        {notificationLists.recentVisitors.length ? notificationLists.recentVisitors.map((visitor) => (
+          <div className="notification-item" key={visitor.id || `${visitor.name}-${visitor.date}`}>
+            <div className="notification-avatar">{initialsOf(visitor.name)}</div>
+            <div className="notification-copy"><strong>{visitor.name}</strong><span>{visitor.className || 'Visitante'} · {formatDateShort(visitor.date)}</span></div>
+          </div>
+        )) : <p className="notification-empty">Sem visitantes registados.</p>}
+      </NotificationGroup>
+
+      <NotificationGroup icon={ClipboardCheck} tone="attendance" title="Presenças pendentes" hint="Sessões dos últimos 30 dias sem presenças" count={notificationLists.pendingAttendance.length}>
+        {notificationLists.pendingAttendance.length ? notificationLists.pendingAttendance.map((session, index) => (
+          <div className="notification-item" key={session.id || `${session.class_id}-${session.sessionValue}-${index}`}>
+            <span className="notification-date">{formatDateShort(session.sessionValue)}</span>
+            <div className="notification-copy"><strong>{classLabel(session.class_id ?? session.classId ?? session.turma)}</strong><span>{session.matriculados} inscritos · 0 presenças</span></div>
+            <span className="notification-tag urgent">Registar</span>
+          </div>
+        )) : <p className="notification-empty">Sem presenças em falta.</p>}
+      </NotificationGroup>
+
+      {notificationLists.missingBirthdays.length > 0 && <NotificationGroup icon={UserRound} title="Dados por completar" hint="Alunos sem data de nascimento" count={notificationLists.missingBirthdays.length}>
+        {notificationLists.missingBirthdays.slice(0, 5).map((member) => (
+          <div className="notification-item" key={member.id}>
+            <div className="notification-avatar">{initialsOf(member.name)}</div>
+            <div className="notification-copy"><strong>{member.name}</strong><span>Falta a data de nascimento</span></div>
+          </div>
+        ))}
+        {notificationLists.missingBirthdays.length > 5 && <p className="notification-empty">E mais {notificationLists.missingBirthdays.length - 5} alunos.</p>}
+      </NotificationGroup>}
+
+      <div className="notifications-settings">
+        <p className="dialog-note">Indicador no cabeçalho: {notificationsEnabled ? 'ativo' : 'inativo'}.</p>
+        <button className="outline-button" onClick={onToggleNotifications}>{notificationsEnabled ? 'Desativar' : 'Ativar'}</button>
+      </div>
     </div>}
     {type === 'profile' && <div className="dialog-copy"><div className="profile-dialog-avatar"><UserRound size={22} /></div><strong>{profile?.displayName || user?.displayName || user?.email}</strong><p>{profile?.status === 'admin' ? 'Administrador com acesso de gestão.' : 'Utilizador com acesso apenas de leitura.'}</p><button className="outline-button" onClick={onSignOut}>Terminar sessão</button></div>}
   </section></div>;
