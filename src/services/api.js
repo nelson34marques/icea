@@ -2,14 +2,59 @@ import { auth } from './firebase';
 
 export const API_URL = (import.meta.env.VITE_API_URL || 'https://ebd-api-n7xg.onrender.com').replace(/\/$/, '');
 
-const REQUEST_TIMEOUT = 45000;
+const REQUEST_TIMEOUT = 30000;
 
-async function authHeader() {
+async function authHeader(forceRefresh = false) {
   const user = auth.currentUser;
   if (!user) throw Object.assign(new Error('Sessão terminada. Inicie sessão novamente.'), { sessao: true });
-  const token = await user.getIdToken();
+  const token = await user.getIdToken(forceRefresh);
   if (!token) throw Object.assign(new Error('Não foi possível validar a sessão. Inicie sessão novamente.'), { sessao: true });
   return { Authorization: `Bearer ${token}` };
+}
+
+async function fetchWithAuth(path, { method = 'GET', corpo, auth = true } = {}) {
+  let forceRefresh = false;
+
+  for (let tentativa = 0; tentativa < 2; tentativa += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    let response;
+
+    try {
+      const headers = { Accept: 'application/json' };
+      if (corpo !== undefined) headers['Content-Type'] = 'application/json';
+      if (auth) Object.assign(headers, await authHeader(forceRefresh));
+
+      response = await fetch(`${API_URL}${path}`, {
+        method,
+        cache: 'no-store',
+        signal: controller.signal,
+        headers,
+        ...(corpo !== undefined ? { body: JSON.stringify(corpo) } : {}),
+      });
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        throw new Error(method === 'GET'
+          ? 'O carregamento está a demorar mais do que o normal. Tente novamente daqui a pouco.'
+          : 'A gravação está a demorar mais do que o normal. Tente novamente.');
+      }
+      if (error?.sessao) throw error;
+      throw new Error(method === 'GET'
+        ? 'Não foi possível carregar os dados. Verifique a ligação e tente novamente.'
+        : 'Não foi possível guardar. Verifique a ligação e tente novamente.');
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (response.status === 401 && auth && tentativa === 0) {
+      forceRefresh = true;
+      continue;
+    }
+
+    return response;
+  }
+
+  throw new Error('Não foi possível validar a sessão. Inicie sessão novamente.');
 }
 
 function listFrom(payload, key) {
@@ -43,24 +88,7 @@ function statusMessage(status, fallback) {
 }
 
 async function request(path) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-
-  let response;
-  try {
-    const authHeaders = await authHeader();
-    response = await fetch(`${API_URL}${path}`, {
-      signal: controller.signal,
-      headers: { Accept: 'application/json', ...authHeaders },
-    });
-  } catch (error) {
-    if (error?.name === 'AbortError') throw new Error('O carregamento está a demorar mais do que o normal. Tente novamente daqui a pouco.');
-    if (error?.sessao) throw error;
-    throw new Error('Não foi possível carregar os dados. Verifique a ligação e tente novamente.');
-  } finally {
-    clearTimeout(timeout);
-  }
-
+  const response = await fetchWithAuth(path);
   if (!response.ok) throw new Error(statusMessage(response.status, 'Não foi possível atualizar os dados. Tente novamente daqui a pouco.'));
   try {
     return await response.json();
@@ -69,27 +97,8 @@ async function request(path) {
   }
 }
 
-async function enviar(path, corpo) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-
-  let response;
-  try {
-    const authHeaders = await authHeader();
-    response = await fetch(`${API_URL}${path}`, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...authHeaders },
-      body: JSON.stringify(corpo),
-    });
-  } catch (error) {
-    if (error?.name === 'AbortError') throw new Error('A gravação está a demorar mais do que o normal. Tente novamente.');
-    if (error?.sessao) throw error;
-    throw new Error('Não foi possível guardar. Verifique a ligação e tente novamente.');
-  } finally {
-    clearTimeout(timeout);
-  }
-
+async function enviar(path, corpo, method = 'POST') {
+  const response = await fetchWithAuth(path, { method, corpo });
   let payload = null;
   try {
     payload = await response.json();
@@ -97,7 +106,10 @@ async function enviar(path, corpo) {
     payload = null;
   }
   if (!response.ok) {
-    throw new Error(payload?.erro || statusMessage(response.status, 'Não foi possível guardar. Tente novamente daqui a pouco.'));
+    throw Object.assign(
+      new Error(payload?.erro || statusMessage(response.status, 'Não foi possível guardar. Tente novamente daqui a pouco.')),
+      { status: response.status },
+    );
   }
   return payload;
 }
@@ -200,8 +212,25 @@ export const api = {
     return enviar('/visitors', { name, classId, date });
   },
 
+  eliminarVisitante(visitorId) {
+    if (!visitorId) throw new Error('Visitante inválido.');
+    return enviar(`/visitors/${encodeURIComponent(visitorId)}`, undefined, 'DELETE');
+  },
+
   criarAluno({ name, birth_date }) {
     return enviar('/members', { name, birth_date, role: 'Aluno' });
+  },
+
+  async eliminarAluno(memberId) {
+    if (!memberId) throw new Error('Aluno inválido.');
+    try {
+      return await enviar(`/members/${encodeURIComponent(memberId)}`, undefined, 'DELETE');
+    } catch (error) {
+      if (error?.status === 404) {
+        throw new Error('O servidor ainda não permite eliminar alunos.');
+      }
+      throw error;
+    }
   },
 
   guardarPresencas({ classId, date, attendance }) {

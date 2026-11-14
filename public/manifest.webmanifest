@@ -9,8 +9,8 @@
   "scope": "/",
   "display": "standalone",
   "display_override": ["window-controls-overlay", "standalone", "minimal-ui", "browser"],
-  "background_color": "#eef4f7",
-  "theme_color": "#173f50",
+  "background_color": "#eef3f4",
+  "theme_color": "#eef3f4",
   "categories": ["productivity", "education", "utilities"],
   "icons": [
     { "src": "/faviconICEA/favicon-96x96.png", "sizes": "96x96", "type": "image/png", "purpose": "any" },

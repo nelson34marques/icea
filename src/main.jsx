@@ -1,4 +1,4 @@
-import { StrictMode, useCallback, useEffect, useMemo, useState } from 'react';
+import { StrictMode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BarChart3,
   Bell,
@@ -23,6 +23,7 @@ import {
   Settings,
   Sparkles,
   Sun,
+  Trash2,
   UserRound,
   UsersRound,
   WifiOff,
@@ -61,6 +62,10 @@ const navItems = [
 const statIcons = { users: UsersRound, chart: BarChart3, book: BookOpen, sparkles: Sparkles };
 
 const EMPTY_DASHBOARD = { stats: {}, classes: [], members: [], sessions: [], visitors: [], attendanceRecords: [] };
+const CACHE_KEY = 'icea-dashboard-cache';
+const SYNC_INTERVAL_MS = 20000;
+const MEMBER_DELETE_ENABLED = import.meta.env.VITE_ENABLE_MEMBER_DELETE !== 'false';
+const podeEliminarAluno = (isAdmin) => isAdmin && MEMBER_DELETE_ENABLED;
 
 function dateKey(value) {
   const raw = String(value || '').trim();
@@ -73,15 +78,29 @@ function dateKey(value) {
 }
 
 function mergeAttendance(apiRecords = [], legacyRecords = []) {
-  const merged = [];
-  const seen = new Set();
+  const merged = new Map();
+  const keyOf = (record) => `${record.classId ?? record.class_id ?? ''}|${dateKey(record.sessionDate ?? record.session_date ?? record.date)}`;
+
   [...apiRecords, ...legacyRecords].forEach((record) => {
-    const key = `${record.classId ?? record.class_id ?? ''}|${dateKey(record.sessionDate ?? record.session_date ?? record.date)}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    merged.push(record);
+    const key = keyOf(record);
+    const normalizado = {
+      ...record,
+      classId: record.classId ?? record.class_id,
+      sessionDate: record.sessionDate ?? record.session_date ?? record.date,
+    };
+    const existente = merged.get(key);
+    if (!existente) {
+      merged.set(key, { ...normalizado, attendance: [...(record.attendance || [])] });
+      return;
+    }
+    const porMembro = new Map();
+    [...(existente.attendance || []), ...(normalizado.attendance || [])].forEach((entry) => {
+      if (entry?.memberId) porMembro.set(entry.memberId, entry);
+    });
+    merged.set(key, { ...existente, ...normalizado, attendance: [...porMembro.values()] });
   });
-  return merged;
+
+  return [...merged.values()];
 }
 
 function mergeVisitors(apiVisitors = [], legacyVisitors = []) {
@@ -272,6 +291,7 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [theme, setTheme] = useState(() => localStorage.getItem('icea-theme') === 'dark' ? 'dark' : 'light');
   const [modal, setModal] = useState('');
+  const [confirmarEliminacao, setConfirmarEliminacao] = useState(null);
   const [fotos, setFotos] = useState({});
   const [fotosCarregadas, setFotosCarregadas] = useState(false);
   const [alvoFoto, setAlvoFoto] = useState(null);
@@ -283,7 +303,7 @@ function App() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => localStorage.getItem('icea-notifications') !== 'false');
   const [dashboard, setDashboard] = useState(() => {
     try {
-      const cached = localStorage.getItem('icea-dashboard-cache');
+      const cached = localStorage.getItem(CACHE_KEY);
       return cached ? JSON.parse(cached) : EMPTY_DASHBOARD;
     } catch {
       return EMPTY_DASHBOARD;
@@ -292,16 +312,19 @@ function App() {
   const [sync, setSync] = useState(() => {
     const hasCache = (() => {
       try {
-        return !!localStorage.getItem('icea-dashboard-cache');
+        return !!localStorage.getItem(CACHE_KEY);
       } catch {
         return false;
       }
     })();
     return hasCache ? { status: 'live', savedAt: 0, error: '' } : { status: 'loading', savedAt: 0, error: '' };
   });
+  const syncEmCurso = useRef(null);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#111b20' : '#eef3f4');
     localStorage.setItem('icea-theme', theme);
   }, [theme]);
 
@@ -310,28 +333,18 @@ function App() {
     const unsubscribeAuth = subscribeToAuthState((user) => {
       unsubscribeProfile();
       if (!user) {
-        setDashboard(() => {
         try {
-          const cached = localStorage.getItem('icea-dashboard-cache');
-          return cached ? JSON.parse(cached) : EMPTY_DASHBOARD;
-        } catch {
-          return EMPTY_DASHBOARD;
-        }
-      });
+          localStorage.removeItem(CACHE_KEY);
+        } catch {}
+        setDashboard(EMPTY_DASHBOARD);
+        setFotos({});
+        setFotosCarregadas(false);
         setLegacyVisitorRecords([]);
         setLegacyAttendanceRecords([]);
         setAttendanceStatus({});
+        setConfirmarEliminacao(null);
         setModal('');
-        setSync(() => {
-          const hasCache = (() => {
-            try {
-              return !!localStorage.getItem('icea-dashboard-cache');
-            } catch {
-              return false;
-            }
-          })();
-          return hasCache ? { status: 'live', savedAt: 0, error: '' } : { status: 'loading', savedAt: 0, error: '' };
-        });
+        setSync({ status: 'loading', savedAt: 0, error: '' });
         setAuthSession({ loading: false, user: null, profile: null, error: '' });
         return;
       }
@@ -364,30 +377,39 @@ function App() {
 
   const isAdmin = authSession.profile?.status === 'admin';
 
-  const syncDashboard = useCallback(async ({ silent = false } = {}) => {
+  const syncDashboard = useCallback(({ silent = false, force = false } = {}) => {
+    if (syncEmCurso.current) {
+      if (!force) return syncEmCurso.current;
+      return syncEmCurso.current.then(() => syncDashboard({ silent, force: false }));
+    }
     if (!silent) setSync((current) => ({ ...current, status: 'loading', error: '' }));
 
-    try {
-      const data = await api.getDashboard();
-      setDashboard(data);
+    const execucao = (async () => {
       try {
-        localStorage.setItem('icea-dashboard-cache', JSON.stringify(data));
-      } catch {}
-      setSync({ status: 'live', savedAt: Date.now(), error: '' });
-    } catch (error) {
-      const hasExisting = (() => {
+        const data = await api.getDashboard();
+        setDashboard(data);
         try {
-          const cached = localStorage.getItem('icea-dashboard-cache');
-          return cached && cached.length > 0;
-        } catch {
-          return false;
-        }
-      })();
-      if (!hasExisting) {
-        setDashboard(EMPTY_DASHBOARD);
+          localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+        } catch {}
+        setSync({ status: 'live', savedAt: Date.now(), error: '' });
+      } catch (error) {
+        const hasExisting = (() => {
+          try {
+            const cached = localStorage.getItem(CACHE_KEY);
+            return Boolean(cached && cached.length > 0);
+          } catch {
+            return false;
+          }
+        })();
+        if (!hasExisting) setDashboard(EMPTY_DASHBOARD);
+        setSync({ status: 'error', savedAt: 0, error: error.message });
+      } finally {
+        syncEmCurso.current = null;
       }
-      setSync({ status: 'error', savedAt: 0, error: error.message });
-    }
+    })();
+
+    syncEmCurso.current = execucao;
+    return execucao;
   }, []);
 
   useEffect(() => {
@@ -395,10 +417,23 @@ function App() {
   }, [authSession.user, authSession.loading, syncDashboard]);
 
   useEffect(() => {
-    const onVisible = () => { if (authSession.user && document.visibilityState === 'visible') syncDashboard({ silent: true }); };
-    document.addEventListener('visibilitychange', onVisible);
-    return () => document.removeEventListener('visibilitychange', onVisible);
-  }, [authSession.user, syncDashboard]);
+    if (!authSession.user || authSession.loading) return undefined;
+
+    const atualizarSeVisivel = () => {
+      if (document.visibilityState === 'visible' && navigator.onLine) syncDashboard({ silent: true });
+    };
+    const intervalo = setInterval(atualizarSeVisivel, SYNC_INTERVAL_MS);
+    document.addEventListener('visibilitychange', atualizarSeVisivel);
+    window.addEventListener('focus', atualizarSeVisivel);
+    window.addEventListener('online', atualizarSeVisivel);
+
+    return () => {
+      clearInterval(intervalo);
+      document.removeEventListener('visibilitychange', atualizarSeVisivel);
+      window.removeEventListener('focus', atualizarSeVisivel);
+      window.removeEventListener('online', atualizarSeVisivel);
+    };
+  }, [authSession.user, authSession.loading, syncDashboard]);
 
   const classes = dashboard.classes ?? [];
   const members = dashboard.members ?? [];
@@ -422,10 +457,18 @@ function App() {
   const hasNoData = !classes.length && !members.length && !sessions.length && !visitors.length;
 
   useEffect(() => {
+    const dataDe = (record) => String(
+      record.sessionDate
+      || record.session_date
+      || record.date
+      || record.createdAt?.toDate?.()?.toISOString?.()
+      || '',
+    );
+    const recentesPrimeiro = [...attendanceRecords].sort((a, b) => dataDe(b).localeCompare(dataDe(a)));
     const nextStatuses = {};
-    for (const record of attendanceRecords) {
+    for (const record of recentesPrimeiro) {
       for (const entry of record.attendance || []) {
-        if (!(entry.memberId in nextStatuses)) nextStatuses[entry.memberId] = entry.status;
+        if (!(entry.memberId in nextStatuses) && entry.status) nextStatuses[entry.memberId] = entry.status;
       }
     }
     setAttendanceStatus(nextStatuses);
@@ -483,7 +526,11 @@ function App() {
       : type === 'Pessoas'
         ? [item.name, getClassName(item.class_id), item.status || 'Registado']
         : [item.name, item.className || 'Visitante', item.date || '']);
-    const csv = [headers, ...values].map((row) => row.map((value) => `"${String(value ?? '').replaceAll('"', '""')}"`).join(';')).join('\n');
+    const csv = [headers, ...values].map((row) => row.map((value) => {
+      let texto = String(value ?? '');
+      if (/^[=+\-@]/.test(texto)) texto = `'${texto}`;
+      return `"${texto.replaceAll('"', '""')}"`;
+    }).join(';')).join('\n');
     const link = document.createElement('a');
     link.href = URL.createObjectURL(new Blob(['\ufeff', csv], { type: 'text/csv;charset=utf-8' }));
     link.download = `${type.toLocaleLowerCase('pt-PT')}-icea.csv`;
@@ -506,7 +553,7 @@ function App() {
     await api.criarVisitante(dados);
     setModal('');
     setNotice('Visitante registado.');
-    await syncDashboard({ silent: true });
+    await syncDashboard({ silent: true, force: true });
   }
 
   async function guardarAluno(dados) {
@@ -514,7 +561,7 @@ function App() {
     const criado = await api.criarAluno(dados);
     setModal('');
     setNotice(criado?.turma ? `Aluno registado na turma ${criado.turma}.` : 'Aluno registado.');
-    await syncDashboard({ silent: true });
+    await syncDashboard({ silent: true, force: true });
   }
 
   async function guardarPresencas(dados) {
@@ -522,7 +569,32 @@ function App() {
     await api.guardarPresencas(dados);
     setModal('');
     setNotice('Presenças registadas.');
-    await syncDashboard({ silent: true });
+    await syncDashboard({ silent: true, force: true });
+  }
+
+  function pedirEliminarVisitante(visitante) {
+    if (!isAdmin) return;
+    setConfirmarEliminacao({ tipo: 'visitante', id: visitante.id, nome: visitante.name });
+  }
+
+  function pedirEliminarAluno(aluno) {
+    if (!podeEliminarAluno(isAdmin)) return;
+    setConfirmarEliminacao({ tipo: 'aluno', id: aluno.id, nome: aluno.name });
+  }
+
+  async function eliminarConfirmado() {
+    if (!confirmarEliminacao || !isAdmin) return;
+    const alvo = confirmarEliminacao;
+    try {
+      if (alvo.tipo === 'visitante') await api.eliminarVisitante(alvo.id);
+      else if (alvo.tipo === 'aluno') await api.eliminarAluno(alvo.id);
+      setConfirmarEliminacao(null);
+      setNotice(alvo.tipo === 'aluno' ? 'Aluno eliminado.' : 'Visitante eliminado.');
+      await syncDashboard({ silent: true, force: true });
+    } catch (error) {
+      setConfirmarEliminacao(null);
+      setNotice(error.message || 'Não foi possível eliminar o registo.');
+    }
   }
 
   function escolherFoto(memberId) {
@@ -640,13 +712,21 @@ function App() {
           </section>
 
           <section className="bottom-grid">
-            <div className="panel people-panel"><div className="panel-heading"><div><span className="section-kicker">Últimos registos</span><h2>Pessoas recentes</h2></div>{isAdmin && <button className="icon-button" onClick={() => exportCsv('Pessoas')} disabled={!visibleMembers.length} aria-label="Exportar pessoas"><Download size={17} /></button>}</div>{visibleMembers.length ? <div className="people-table"><div className="table-head"><span>Pessoa</span><span>Turma</span><span>Estado</span></div>{visibleMembers.slice(0, 4).map((person) => <div className="person-row" key={person.id}><div className="person-name">{fotos[person.id] ? <img className="avatar avatar-photo" src={fotos[person.id]} alt="" /> : <div className="avatar">{person.initials || initialsOf(person.name)}</div>}<strong>{person.name}</strong></div><span>{getClassName(person.class_id)}</span><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Ainda não há pessoas para mostrar" hint="Se esperava ver nomes, atualize os dados. Se continuar, peça ajuda ao responsável." />}</div>
-            <div className="panel visitors-panel"><div className="panel-heading"><div><span className="section-kicker">Acolhimento</span><h2>Visitantes recentes</h2></div><button className="text-button" onClick={() => setActive('Pessoas')}>Ver todos <span>↗</span></button></div>{visitors.length ? <div className="visitor-list">{visitors.slice(0, 3).map((visitor) => <div className="visitor-row" key={visitor.id}><div className="avatar visitor-avatar">{visitor.initials || initialsOf(visitor.name)}</div><div><strong>{visitor.name}</strong><small>{visitor.className || 'Visitante'}</small></div><time>{visitor.date || 'Data indisponível'}</time></div>)}</div> : <EmptyState icon={Sparkles} title="Sem visitantes registados" hint="Os visitantes aparecem aqui depois de uma sessão." />}{isAdmin && <button className="outline-button" onClick={() => setModal('visitor')}><Plus size={16} /> Adicionar visitante</button>}</div>
+            <div className="panel people-panel"><div className="panel-heading"><div><span className="section-kicker">Últimos registos</span><h2>Pessoas recentes</h2></div>{isAdmin && <button className="icon-button" onClick={() => exportCsv('Pessoas')} disabled={!visibleMembers.length} aria-label="Exportar pessoas"><Download size={17} /></button>}</div>{visibleMembers.length ? <div className="people-table"><div className="table-head"><span>Pessoa</span><span>Turma</span><span>Estado</span></div>{visibleMembers.slice(0, 4).map((person) => <div className="person-row" key={person.id}><div className="person-name">{fotos[person.id] ? <img className="avatar avatar-photo" src={fotos[person.id]} alt="" /> : <div className="avatar">{person.initials || initialsOf(person.name)}</div>}<strong>{person.name}</strong></div><span data-label="Turma">{getClassName(person.class_id)}</span><span className="status-cell" data-label="Estado"><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span>{podeEliminarAluno(isAdmin) && <button className="icon-button danger-icon" onClick={() => pedirEliminarAluno(person)} title="Eliminar aluno" aria-label={`Eliminar aluno ${person.name}`}><Trash2 size={14} /></button>}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Ainda não há pessoas para mostrar" hint="Se esperava ver nomes, atualize os dados. Se continuar, peça ajuda ao responsável." />}</div>
+            <div className="panel visitors-panel"><div className="panel-heading"><div><span className="section-kicker">Acolhimento</span><h2>Visitantes recentes</h2></div><button className="text-button" onClick={() => setActive('Pessoas')}>Ver todos <span>↗</span></button></div>{visitors.length ? <div className="visitor-list">{visitors.slice(0, 3).map((visitor) => <div className="visitor-row" key={visitor.id}><div className="avatar visitor-avatar">{visitor.initials || initialsOf(visitor.name)}</div><div><strong>{visitor.name}</strong><small>{visitor.className || 'Visitante'}</small></div><time>{visitor.date || 'Data indisponível'}</time>{isAdmin && <button className="icon-button danger-icon" onClick={() => pedirEliminarVisitante(visitor)} title="Eliminar visitante" aria-label={`Eliminar visitante ${visitor.name}`}><Trash2 size={14} /></button>}</div>)}</div> : <EmptyState icon={Sparkles} title="Sem visitantes registados" hint="Os visitantes aparecem aqui depois de uma sessão." />}{isAdmin && <button className="outline-button" onClick={() => setModal('visitor')}><Plus size={16} /> Adicionar visitante</button>}</div>
           </section>
-          </> : hasNoData ? <EmptyState icon={Inbox} title="Ainda não há dados para mostrar" hint="Atualize os dados. Se continuar sem informação, peça ajuda ao responsável." /> : <WorkspacePage active={active} classes={classes} members={visibleMembers} visitors={visitors} sessions={sessions} attendanceRecords={attendanceRecords} getClassName={getClassName} onExport={exportCsv} sync={sync} onSync={() => syncDashboard()} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} isAdmin={isAdmin} fotos={fotos} onPhoto={escolherFoto} onAttendance={() => setModal('attendance')} onVisitor={() => setModal('visitor')} onMember={() => setModal('member')} />}
+          </> : hasNoData ? <EmptyState icon={Inbox} title="Ainda não há dados para mostrar" hint="Atualize os dados. Se continuar sem informação, peça ajuda ao responsável." /> : <WorkspacePage active={active} classes={classes} members={visibleMembers} visitors={visitors} sessions={sessions} attendanceRecords={attendanceRecords} getClassName={getClassName} onExport={exportCsv} sync={sync} onSync={() => syncDashboard()} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} isAdmin={isAdmin} fotos={fotos} onPhoto={escolherFoto} onAttendance={() => setModal('attendance')} onVisitor={() => setModal('visitor')} onMember={() => setModal('member')} onDeleteVisitor={pedirEliminarVisitante} onDeleteMember={pedirEliminarAluno} />}
         </div>
       </main>
       {modal && <ActionDialog type={modal} classes={classes} members={visibleMembers} birthdayNotifications={birthdayNotifications} onClose={() => setModal('')} onSaveAttendance={guardarPresencas} onSaveVisitor={guardarVisitante} onSaveMember={guardarAluno} notificationsEnabled={notificationsEnabled} onToggleNotifications={toggleNotifications} user={authSession.user} profile={authSession.profile} onSignOut={signOutUser} />}
+
+      {confirmarEliminacao && <ConfirmDialog
+        title={confirmarEliminacao.tipo === 'aluno' ? 'Eliminar aluno' : 'Eliminar visitante'}
+        message={`Tem a certeza de que quer eliminar ${confirmarEliminacao.tipo === 'aluno' ? 'o aluno' : 'o visitante'} "${confirmarEliminacao.nome}"? Esta ação não pode ser revertida.`}
+        confirmLabel="Eliminar"
+        onConfirm={eliminarConfirmado}
+        onCancel={() => setConfirmarEliminacao(null)}
+      />}
 
       <input id="input-foto" type="file" accept="image/*" className="input-foto-oculto" onChange={aoEscolherFoto} aria-label="Escolher foto do aluno" />
 
@@ -669,6 +749,10 @@ function EmptyState({ icon: Icon = Inbox, title, hint }) {
   return <div className="empty-state"><Icon size={24} /><strong>{title}</strong>{hint && <span>{hint}</span>}</div>;
 }
 
+function ConfirmDialog({ title, message, confirmLabel = 'Confirmar', onConfirm, onCancel }) {
+  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}><section className="action-dialog confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><div className="dialog-heading"><h2 id="confirm-title">{title}</h2><button className="icon-button" onClick={onCancel} aria-label="Fechar"><X size={18} /></button></div><p className="confirm-message">{message}</p><div className="confirm-actions"><button className="outline-button" onClick={onCancel}>Cancelar</button><button className="danger-button" onClick={onConfirm}><Trash2 size={16} /> {confirmLabel}</button></div></section></div>;
+}
+
 function DashboardSkeleton() {
   return <div className="skeleton-wrap" aria-busy="true" aria-label="A carregar dados">
     <section className="stats-grid">{Array.from({ length: 4 }, (_, index) => <article className="stat-card" key={index}><div className="skeleton skeleton-icon" /><div className="skeleton-lines"><span className="skeleton" style={{ width: '58%' }} /><span className="skeleton" style={{ width: '38%', height: 24 }} /><span className="skeleton" style={{ width: '44%' }} /></div></article>)}</section>
@@ -676,7 +760,7 @@ function DashboardSkeleton() {
   </div>;
 }
 
-function WorkspacePage({ active, classes, members, visitors, sessions, attendanceRecords = [], getClassName, onExport, sync, onSync, notificationsEnabled, onToggleNotifications, isAdmin, fotos = {}, onPhoto, onAttendance, onVisitor, onMember }) {
+function WorkspacePage({ active, classes, members, visitors, sessions, attendanceRecords = [], getClassName, onExport, sync, onSync, notificationsEnabled, onToggleNotifications, isAdmin, fotos = {}, onPhoto, onAttendance, onVisitor, onMember, onDeleteVisitor, onDeleteMember }) {
   function avatarPessoa(person) {
     const foto = fotos[person.id];
     if (foto) {
@@ -691,7 +775,7 @@ function WorkspacePage({ active, classes, members, visitors, sessions, attendanc
   }
   if (active === 'Turmas') return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Organização</span><h1>Turmas</h1><p>{classes.length ? plural(classes.length, 'turma disponível', 'turmas disponíveis') : 'Sem dados recebidos'}</p></div><button className="outline-button export-button" onClick={() => onExport('Turmas')} disabled={!classes.length}><Download size={16} /> Exportar CSV</button></div>{classes.length ? <div className="workspace-list">{classes.map((item, index) => <article className="workspace-row" key={item.id}><div className={`class-badge ${item.color || ['coral', 'sky', 'gold', 'mint'][index % 4]}`}><BookOpen size={17} /></div><div className="workspace-row-copy"><strong>{item.name}</strong><small>{item.age_min != null && item.age_max != null ? `${item.age_min}–${item.age_max} anos` : 'Faixa etária não indicada'} · {item.professor_name || item.equipa?.Professor?.[0]?.nome || 'Equipa por consultar'}</small></div><span>{item.alunos ?? item.students ?? 0} alunos</span></article>)}</div> : <EmptyState icon={BookOpen} title="Ainda não há turmas para mostrar" hint="As turmas aparecerão aqui quando estiverem disponíveis." />}</section>;
 
-  if (active === 'Pessoas') return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Comunidade</span><h1>Pessoas</h1><p>{members.length || visitors.length ? `${plural(members.length, 'pessoa registada', 'pessoas registadas')} e ${plural(visitors.length, 'visitante', 'visitantes')}` : 'Ainda não há pessoas para mostrar'}</p></div><div className="workspace-actions"><button className="outline-button export-button" onClick={() => onExport('Pessoas')} disabled={!members.length}><Download size={16} /> Exportar</button>{isAdmin && <button className="outline-button" onClick={onVisitor}><Plus size={16} /> Visitante</button>}{isAdmin && <button className="primary-button" onClick={onMember}><Plus size={16} /> Aluno</button>}</div></div>{members.length ? <div className="panel workspace-table"><div className="workspace-table-head"><span>Nome</span><span>Turma</span><span>Estado</span></div>{members.map((person) => <div className="workspace-table-row" key={person.id}><strong>{avatarPessoa(person)}{person.name}</strong><span>{getClassName(person.class_id)}</span><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Ainda não há pessoas para mostrar" hint="Se esperava ver nomes, atualize os dados. Se continuar, peça ajuda ao responsável." />}<h2 className="workspace-subheading">Visitantes</h2>{visitors.length ? <div className="panel workspace-table">{visitors.map((visitor) => <div className="workspace-table-row visitor-table-row" key={visitor.id}><strong>{visitor.name}</strong><span>{visitor.className || 'Visitante'}</span><span>{visitor.date || 'Data indisponível'}</span></div>)}</div> : <EmptyState icon={Sparkles} title="Ainda não há visitantes para mostrar" hint="Os visitantes aparecerão aqui quando forem registados." />}</section>;
+  if (active === 'Pessoas') return <section className="workspace-view"><div className="workspace-heading"><div><span className="section-kicker">Comunidade</span><h1>Pessoas</h1><p>{members.length || visitors.length ? `${plural(members.length, 'pessoa registada', 'pessoas registadas')} e ${plural(visitors.length, 'visitante', 'visitantes')}` : 'Ainda não há pessoas para mostrar'}</p></div><div className="workspace-actions"><button className="outline-button export-button" onClick={() => onExport('Pessoas')} disabled={!members.length}><Download size={16} /> Exportar</button>{isAdmin && <button className="outline-button" onClick={onVisitor}><Plus size={16} /> Visitante</button>}{isAdmin && <button className="primary-button" onClick={onMember}><Plus size={16} /> Aluno</button>}</div></div>{members.length ? <div className="panel workspace-table"><div className="workspace-table-head"><span>Nome</span><span>Turma</span><span>Estado</span></div>{members.map((person) => <div className="workspace-table-row" key={person.id}><strong>{avatarPessoa(person)}{person.name}</strong><span data-label="Turma">{getClassName(person.class_id)}</span><span className="status-cell" data-label="Estado"><span className={`presence ${person.status === 'Ausente' ? 'absent' : person.status === 'Presente' ? 'present' : 'unknown'}`}><i />{person.status || 'Sem estado'}</span>{podeEliminarAluno(isAdmin) && onDeleteMember && <button className="icon-button danger-icon" onClick={() => onDeleteMember(person)} title="Eliminar aluno" aria-label={`Eliminar aluno ${person.name}`}><Trash2 size={14} /></button>}</span></div>)}</div> : <EmptyState icon={UsersRound} title="Ainda não há pessoas para mostrar" hint="Se esperava ver nomes, atualize os dados. Se continuar, peça ajuda ao responsável." />}<h2 className="workspace-subheading">Visitantes</h2>{visitors.length ? <div className="panel workspace-table">{visitors.map((visitor) => <div className="workspace-table-row visitor-table-row" key={visitor.id}><strong>{visitor.name}</strong><span data-label="Turma">{visitor.className || 'Visitante'}</span><span className="visitor-date-cell" data-label="Data">{visitor.date || 'Data indisponível'}{isAdmin && onDeleteVisitor && <button className="icon-button danger-icon" onClick={() => onDeleteVisitor(visitor)} title="Eliminar visitante" aria-label={`Eliminar visitante ${visitor.name}`}><Trash2 size={14} /></button>}</span></div>)}</div> : <EmptyState icon={Sparkles} title="Ainda não há visitantes para mostrar" hint="Os visitantes aparecerão aqui quando forem registados." />}</section>;
 
   if (active === 'Presenças') {
     const records = attendanceRecords.slice().sort((a, b) => {
@@ -708,7 +792,7 @@ function WorkspacePage({ active, classes, members, visitors, sessions, attendanc
           const m = members.find((mm) => String(mm.id) === String(e.memberId));
           return { ...e, name: m?.name || e.memberId };
         });
-        return <section className="panel attendance-class" key={rec.id} style={{ marginBottom: 16 }}>
+        return <section className="panel attendance-class" key={rec.id}>
           <div className="panel-heading"><div><span className="section-kicker">Sessão</span><h2>{turmaNome} · {formatDatePt(sessDate) || 'Data não indicada'}</h2></div><span className="attendance-count">{items.filter((i) => i.status === 'Presente').length}/{items.length} presentes</span></div>
           {items.map((i) => <div className="attendance-person" key={i.memberId}>{fotos[i.memberId] ? <img className="avatar avatar-photo" src={fotos[i.memberId]} alt="" /> : <div className="avatar">{initialsOf(i.name)}</div>}<strong>{i.name}</strong><span className={`presence ${i.status === 'Ausente' ? 'absent' : 'present'}`}><i />{i.status}</span></div>)}
         </section>;
